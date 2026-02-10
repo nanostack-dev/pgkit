@@ -1,0 +1,44 @@
+name: Release Patch
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute next patch version
+        id: version
+        run: |
+          latest_tag=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
+          if [ -z "$latest_tag" ]; then
+            next_tag="v0.0.1"
+          else
+            version=${latest_tag#v}
+            major=$(printf '%s' "$version" | cut -d. -f1)
+            minor=$(printf '%s' "$version" | cut -d. -f2)
+            patch=$(printf '%s' "$version" | cut -d. -f3)
+            patch=$((patch + 1))
+            next_tag="v${major}.${minor}.${patch}"
+          fi
+          echo "next_tag=$next_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          git tag "${{ steps.version.outputs.next_tag }}"
+          git push origin "${{ steps.version.outputs.next_tag }}"
