@@ -739,6 +739,71 @@ func TestListJobsWithFilters(t *testing.T) {
 	if len(jobs) != 3 {
 		t.Fatalf("expected 3 pending jobs, got %d", len(jobs))
 	}
+
+	// Full-text search should filter safely (including SQL-like payload).
+	_, _ = q.Enqueue(ctx, EnqueueParams{QueueName: "alpha", Payload: []byte("drop table users; --")})
+	jobs, err = q.ListJobs(ctx, ListJobsParams{Limit: 10, Search: "drop table"})
+	if err != nil {
+		t.Fatalf("list search: %v", err)
+	}
+	if len(jobs) < 1 {
+		t.Fatal("expected at least one search match")
+	}
+
+	// Count with same filters should be consistent.
+	total, err := q.CountJobs(ctx, ListJobsParams{Search: "drop table"})
+	if err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if total < 1 {
+		t.Fatalf("expected search total >= 1, got %d", total)
+	}
+}
+
+func TestReplayAndDeleteJob(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if err := q.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	jobID, err := q.Enqueue(ctx, EnqueueParams{QueueName: "ops", Payload: []byte("x"), MaxAttempts: 1})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	job, found, err := q.Claim(ctx, "ops", "w1")
+	if err != nil || !found {
+		t.Fatalf("claim: %v found=%v", err, found)
+	}
+	if err := q.Fail(ctx, job.ID, errSample("fail once")); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	if err := q.ReplayJob(ctx, jobID); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+
+	replayed, err := q.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("get replayed: %v", err)
+	}
+	if replayed.Status != StatusPending || replayed.Attempts != 0 {
+		t.Fatalf("expected replayed pending with attempts=0, got status=%s attempts=%d", replayed.Status, replayed.Attempts)
+	}
+
+	if err := q.DeleteJob(ctx, jobID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if _, err := q.GetJob(ctx, jobID); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("expected not found after delete, got %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +909,7 @@ func TestDashboardJSONAPIEnqueue(t *testing.T) {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("HX-Request", "true")
 	req.SetBasicAuth("admin", "api-secret")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -862,6 +928,86 @@ func TestDashboardJSONAPIEnqueue(t *testing.T) {
 	if _, ok := out["id"]; !ok {
 		t.Fatalf("expected id in response, got %+v", out)
 	}
+}
+
+func TestDashboardSearchReplayDeleteFlow(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if err := q.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	id, err := q.Enqueue(ctx, EnqueueParams{QueueName: "admin", Payload: []byte("needle")})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	job, found, err := q.Claim(ctx, "admin", "w1")
+	if err != nil || !found {
+		t.Fatalf("claim: %v found=%v", err, found)
+	}
+	if err := q.Fail(ctx, job.ID, errSample("for replay")); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	t.Setenv("PGKIT_DASHBOARD_TOKEN", "ops-secret")
+	dash, err := NewDashboardFromEnvWithOptions(q, DashboardOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	srv := httptest.NewServer(dash.Handler())
+	defer srv.Close()
+
+	// Search fragment should include the row.
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/fragment/jobs?search=needle&limit=10", nil)
+	if err != nil {
+		t.Fatalf("request search: %v", err)
+	}
+	req.SetBasicAuth("admin", "ops-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("search request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on search, got %d", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// Replay via HTMX endpoint.
+	req, err = http.NewRequest(http.MethodPost, fmt.Sprintf("%s/jobs/%d/replay", srv.URL, id), nil)
+	if err != nil {
+		t.Fatalf("request replay: %v", err)
+	}
+	req.Header.Set("HX-Request", "true")
+	req.SetBasicAuth("admin", "ops-secret")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("replay request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on replay, got %d", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// Delete via HTMX endpoint.
+	req, err = http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/jobs/%d", srv.URL, id), nil)
+	if err != nil {
+		t.Fatalf("request delete: %v", err)
+	}
+	req.Header.Set("HX-Request", "true")
+	req.SetBasicAuth("admin", "ops-secret")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("delete request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on delete, got %d", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
 }
 
 func TestDashboardDisableEnqueueAPI(t *testing.T) {
@@ -967,6 +1113,68 @@ func TestDashboardCSRFBlocksPlainPost(t *testing.T) {
 		t.Fatalf("expected 403, got %d", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
+}
+
+func TestDashboardCSRFBlocksReplayAndDeleteWithoutHX(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if err := q.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	id, err := q.Enqueue(ctx, EnqueueParams{QueueName: "csrf", Payload: []byte("x")})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	job, found, err := q.Claim(ctx, "csrf", "w1")
+	if err != nil || !found {
+		t.Fatalf("claim: %v found=%v", err, found)
+	}
+	if err := q.Fail(ctx, job.ID, errSample("fail")); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	t.Setenv("PGKIT_DASHBOARD_TOKEN", "secret")
+	dash, err := NewDashboardFromEnv(q)
+	if err != nil {
+		t.Fatalf("new dashboard: %v", err)
+	}
+
+	srv := httptest.NewServer(dash.Handler())
+	defer srv.Close()
+
+	replayReq, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/jobs/%d/replay", srv.URL, id), nil)
+	if err != nil {
+		t.Fatalf("new replay request: %v", err)
+	}
+	replayReq.SetBasicAuth("admin", "secret")
+	replayResp, err := http.DefaultClient.Do(replayReq)
+	if err != nil {
+		t.Fatalf("replay call: %v", err)
+	}
+	if replayResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected replay 403 without HX, got %d", replayResp.StatusCode)
+	}
+	_ = replayResp.Body.Close()
+
+	deleteReq, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/jobs/%d", srv.URL, id), nil)
+	if err != nil {
+		t.Fatalf("new delete request: %v", err)
+	}
+	deleteReq.SetBasicAuth("admin", "secret")
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatalf("delete call: %v", err)
+	}
+	if deleteResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected delete 403 without HX, got %d", deleteResp.StatusCode)
+	}
+	_ = deleteResp.Body.Close()
 }
 
 func TestDashboardConstantTimeTokenCompare(t *testing.T) {

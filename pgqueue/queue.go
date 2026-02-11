@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"strings"
 	"time"
 )
 
@@ -16,10 +17,13 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	ErrNilDB        = errors.New("pgqueue: db is nil")
-	ErrInvalidQueue = errors.New("pgqueue: queue name is required")
-	ErrInvalidLimit = errors.New("pgqueue: limit must be positive")
-	ErrJobNotFound  = errors.New("pgqueue: job not found or not in expected state")
+	ErrNilDB         = errors.New("pgqueue: db is nil")
+	ErrInvalidQueue  = errors.New("pgqueue: queue name is required")
+	ErrInvalidLimit  = errors.New("pgqueue: limit must be positive")
+	ErrJobNotFound   = errors.New("pgqueue: job not found or not in expected state")
+	ErrInvalidOffset = errors.New("pgqueue: offset must be non-negative")
+	ErrSearchTooLong = errors.New("pgqueue: search query is too long")
+	ErrJobBusy       = errors.New("pgqueue: job is currently processing")
 )
 
 // ---------------------------------------------------------------------------
@@ -37,6 +41,8 @@ const (
 )
 
 const defaultMaxAttempts = 5
+
+const maxSearchLength = 256
 
 // schemaVersion is the current version of the pgqueue schema.
 // Bump this when adding migrations.
@@ -77,6 +83,7 @@ type ListJobsParams struct {
 	QueueName string    // optional filter
 	Status    JobStatus // optional filter
 	Offset    int       // optional pagination offset
+	Search    string    // optional full-text filter over queue_name/payload/last_error
 }
 
 // PurgeParams holds parameters for purging old jobs.
@@ -596,6 +603,13 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	if p.Limit <= 0 {
 		return nil, ErrInvalidLimit
 	}
+	if p.Offset < 0 {
+		return nil, ErrInvalidOffset
+	}
+	p.Search = strings.TrimSpace(p.Search)
+	if len(p.Search) > maxSearchLength {
+		return nil, ErrSearchTooLong
+	}
 
 	// Build query dynamically based on optional filters.
 	query := `SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
@@ -612,6 +626,15 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	if p.Status != "" {
 		query += fmt.Sprintf(" AND status = $%d", argIdx)
 		args = append(args, string(p.Status))
+		argIdx++
+	}
+	if p.Search != "" {
+		// Security: search term is bound as a parameter. Never interpolate user input into SQL text.
+		query += fmt.Sprintf(
+			" AND (queue_name ILIKE $%d OR encode(payload, 'escape') ILIKE $%d OR COALESCE(last_error, '') ILIKE $%d)",
+			argIdx, argIdx, argIdx,
+		)
+		args = append(args, "%"+p.Search+"%")
 		argIdx++
 	}
 
@@ -649,6 +672,143 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	}
 
 	return jobs, nil
+}
+
+// CountJobs returns the number of jobs matching optional filters.
+func (c *Client) CountJobs(ctx context.Context, p ListJobsParams) (int64, error) {
+	if c == nil || c.db == nil {
+		return 0, ErrNilDB
+	}
+	if p.Offset < 0 {
+		return 0, ErrInvalidOffset
+	}
+	p.Search = strings.TrimSpace(p.Search)
+	if len(p.Search) > maxSearchLength {
+		return 0, ErrSearchTooLong
+	}
+
+	query := `SELECT COUNT(*) FROM pgqueue_jobs WHERE 1=1`
+	args := make([]any, 0, 4)
+	argIdx := 1
+
+	if p.QueueName != "" {
+		query += fmt.Sprintf(" AND queue_name = $%d", argIdx)
+		args = append(args, p.QueueName)
+		argIdx++
+	}
+	if p.Status != "" {
+		query += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, string(p.Status))
+		argIdx++
+	}
+	if p.Search != "" {
+		query += fmt.Sprintf(
+			" AND (queue_name ILIKE $%d OR encode(payload, 'escape') ILIKE $%d OR COALESCE(last_error, '') ILIKE $%d)",
+			argIdx, argIdx, argIdx,
+		)
+		args = append(args, "%"+p.Search+"%")
+	}
+
+	var total int64
+	if err := c.db.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("pgqueue: count jobs: %w", err)
+	}
+	return total, nil
+}
+
+// GetJob returns a single job by ID.
+func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
+	if c == nil || c.db == nil {
+		return nil, ErrNilDB
+	}
+
+	row := c.db.QueryRowContext(ctx,
+		`SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
+                claimed_by, claimed_at, done_at, last_error, created_at, updated_at
+         FROM pgqueue_jobs WHERE id = $1`,
+		id,
+	)
+
+	var j Job
+	if err := row.Scan(
+		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
+		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
+		&j.CreatedAt, &j.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrJobNotFound
+		}
+		return nil, fmt.Errorf("pgqueue: get job: %w", err)
+	}
+
+	return &j, nil
+}
+
+// ReplayJob resets a done/failed job to pending and clears runtime state.
+func (c *Client) ReplayJob(ctx context.Context, id int64) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+
+	res, err := c.db.ExecContext(ctx,
+		`UPDATE pgqueue_jobs
+         SET status = 'pending',
+             attempts = 0,
+             available_at = NOW(),
+             claimed_by = NULL,
+             claimed_at = NULL,
+             done_at = NULL,
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE id = $1
+           AND status IN ('done', 'failed')`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("pgqueue: replay: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("pgqueue: replay id=%d: %w", id, ErrJobNotFound)
+	}
+
+	c.emit(ctx, EventRetry, map[string]any{"id": id, "replay": true})
+	return nil
+}
+
+// DeleteJob deletes a job that is not currently processing.
+func (c *Client) DeleteJob(ctx context.Context, id int64) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+
+	res, err := c.db.ExecContext(ctx,
+		`DELETE FROM pgqueue_jobs WHERE id = $1 AND status <> 'processing'`,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("pgqueue: delete job: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		c.emit(ctx, EventPurge, map[string]any{"id": id, "delete": true})
+		return nil
+	}
+
+	// Distinguish not-found from busy.
+	var status string
+	err = c.db.QueryRowContext(ctx, `SELECT status FROM pgqueue_jobs WHERE id = $1`, id).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("pgqueue: delete job id=%d: %w", id, ErrJobNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("pgqueue: delete job status check: %w", err)
+	}
+	if status == string(StatusProcessing) {
+		return fmt.Errorf("pgqueue: delete job id=%d: %w", id, ErrJobBusy)
+	}
+
+	return fmt.Errorf("pgqueue: delete job id=%d: %w", id, ErrJobNotFound)
 }
 
 // ---------------------------------------------------------------------------
