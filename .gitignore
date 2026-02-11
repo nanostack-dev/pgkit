@@ -1,0 +1,34 @@
+# OS files
+.DS_Store
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+coverage.out
+*.coverprofile
+*.prof
+
+# Build/output directories
+bin/
+dist/
+build/
+tmp/
+
+# IDE/editor
+.idea/
+*.iml
+.vscode/
+
+# Local environment files
+.env
+.env.*
+
+# Optional local cache directories
+.cache/

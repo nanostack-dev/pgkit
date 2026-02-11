@@ -2,6 +2,7 @@ package pgqueue
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -143,6 +144,16 @@ type WorkerConfig struct {
 	BackoffBase       time.Duration
 	BackoffMax        time.Duration
 	RetryDelay        RetryDelayFunc
+
+	// OnJobFailed is called when a job permanently fails (NonRetryable error
+	// or max retries exhausted via Retry's zombie-prevention path).
+	// nil = no callback.
+	OnJobFailed func(ctx context.Context, job Job)
+
+	// OnJobStuck is called when the reaper recovers stuck jobs.
+	// result contains the count of requeued and failed jobs.
+	// nil = no callback.
+	OnJobStuck func(ctx context.Context, result ReapResult)
 }
 
 func (c WorkerConfig) withDefaults() WorkerConfig {
@@ -256,6 +267,10 @@ func (w *Worker) runOnce(ctx context.Context) {
 				if IsNonRetryable(err) {
 					if failErr := w.client.Fail(ctx, job.ID, err); failErr != nil {
 						w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
+					} else if w.cfg.OnJobFailed != nil {
+						job.Status = StatusFailed
+						job.LastError = sql.NullString{String: err.Error(), Valid: true}
+						w.cfg.OnJobFailed(ctx, *job)
 					}
 					continue
 				}
@@ -263,6 +278,11 @@ func (w *Worker) runOnce(ctx context.Context) {
 				delay := w.cfg.RetryDelay(*job, err)
 				if retryErr := w.client.Retry(ctx, job.ID, delay, err); retryErr != nil {
 					w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
+				} else if job.Attempts >= job.MaxAttempts && w.cfg.OnJobFailed != nil {
+					// Retry's zombie-prevention moved it to failed.
+					job.Status = StatusFailed
+					job.LastError = sql.NullString{String: err.Error(), Valid: true}
+					w.cfg.OnJobFailed(ctx, *job)
 				}
 				continue
 			}
@@ -281,6 +301,9 @@ func (w *Worker) reap(ctx context.Context) error {
 	}
 	if result.Requeued > 0 || result.Failed > 0 {
 		w.client.logWarn(ctx, "queue reaped stuck jobs", map[string]any{"requeued": result.Requeued, "failed": result.Failed})
+		if w.cfg.OnJobStuck != nil {
+			w.cfg.OnJobStuck(ctx, result)
+		}
 	}
 	return nil
 }

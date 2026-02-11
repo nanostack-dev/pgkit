@@ -203,6 +203,181 @@ func TestWorkerDecodeErrorNonRetryable(t *testing.T) {
 	})
 }
 
+func TestWorkerOnJobFailedNonRetryable(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkerTestDB(t, ctx)
+
+	q, _ := New(db)
+	_ = q.EnsureSchema(ctx)
+
+	registry := NewHandlerRegistry()
+	_ = registry.Register("cb-fail", func(_ context.Context, _ Job) error {
+		return NonRetryable(errors.New("permanent error"))
+	})
+
+	var failedJob atomic.Value
+	worker, _ := NewWorker(q, registry, WorkerConfig{
+		PollInterval:      20 * time.Millisecond,
+		ReapInterval:      1 * time.Second,
+		BackoffBase:       10 * time.Millisecond,
+		BackoffMax:        1 * time.Second,
+		BatchSizePerQueue: 10,
+		OnJobFailed: func(_ context.Context, job Job) {
+			failedJob.Store(job)
+		},
+	})
+
+	_, _ = q.Enqueue(ctx, EnqueueParams{QueueName: "cb-fail", Payload: []byte(`{"x":1}`), MaxAttempts: 3})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = worker.Run(runCtx) }()
+
+	requireEventually(t, 4*time.Second, 40*time.Millisecond, func() bool {
+		v := failedJob.Load()
+		if v == nil {
+			return false
+		}
+		job := v.(Job)
+		return job.Status == StatusFailed && job.LastError.Valid && job.LastError.String == "permanent error"
+	})
+}
+
+func TestWorkerOnJobFailedRetryExhaustion(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkerTestDB(t, ctx)
+
+	q, _ := New(db)
+	_ = q.EnsureSchema(ctx)
+
+	registry := NewHandlerRegistry()
+	_ = registry.Register("cb-exhaust", func(_ context.Context, _ Job) error {
+		return errors.New("always fails")
+	})
+
+	var failedJob atomic.Value
+	worker, _ := NewWorker(q, registry, WorkerConfig{
+		PollInterval:      20 * time.Millisecond,
+		ReapInterval:      1 * time.Second,
+		BackoffBase:       10 * time.Millisecond,
+		BackoffMax:        50 * time.Millisecond,
+		BatchSizePerQueue: 10,
+		OnJobFailed: func(_ context.Context, job Job) {
+			failedJob.Store(job)
+		},
+	})
+
+	// MaxAttempts=2: first attempt retries, second attempt exhausts
+	_, _ = q.Enqueue(ctx, EnqueueParams{QueueName: "cb-exhaust", Payload: []byte(`{"x":1}`), MaxAttempts: 2})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = worker.Run(runCtx) }()
+
+	requireEventually(t, 6*time.Second, 50*time.Millisecond, func() bool {
+		v := failedJob.Load()
+		if v == nil {
+			return false
+		}
+		job := v.(Job)
+		return job.Status == StatusFailed
+	})
+}
+
+func TestWorkerOnJobStuck(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkerTestDB(t, ctx)
+
+	q, _ := New(db)
+	_ = q.EnsureSchema(ctx)
+
+	// Enqueue and claim a job manually to simulate a stuck processing job.
+	_, _ = q.Enqueue(ctx, EnqueueParams{QueueName: "cb-stuck", Payload: []byte(`{"x":1}`), MaxAttempts: 3})
+	job, found, err := q.Claim(ctx, "cb-stuck", "ghost-worker")
+	if err != nil || !found {
+		t.Fatalf("claim: found=%v err=%v", found, err)
+	}
+
+	// Backdate claimed_at so the reaper considers it stuck.
+	_, err = db.ExecContext(ctx,
+		`UPDATE pgqueue_jobs SET claimed_at = NOW() - INTERVAL '10 minutes' WHERE id = $1`, job.ID)
+	if err != nil {
+		t.Fatalf("backdate claimed_at: %v", err)
+	}
+
+	// Create a worker with a short reap interval and a tiny visibility timeout.
+	registry := NewHandlerRegistry()
+	_ = registry.Register("cb-stuck", func(_ context.Context, _ Job) error { return nil })
+
+	var stuckResult atomic.Value
+	worker, _ := NewWorker(q, registry, WorkerConfig{
+		PollInterval:      100 * time.Millisecond,
+		ReapInterval:      100 * time.Millisecond,
+		VisibilityTimeout: 1 * time.Second, // job claimed 10min ago > 1s timeout
+		BackoffBase:       10 * time.Millisecond,
+		BackoffMax:        1 * time.Second,
+		BatchSizePerQueue: 10,
+		OnJobStuck: func(_ context.Context, result ReapResult) {
+			stuckResult.Store(result)
+		},
+	})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = worker.Run(runCtx) }()
+
+	requireEventually(t, 4*time.Second, 50*time.Millisecond, func() bool {
+		v := stuckResult.Load()
+		if v == nil {
+			return false
+		}
+		result := v.(ReapResult)
+		return result.Requeued > 0 || result.Failed > 0
+	})
+}
+
+func TestWorkerOnJobFailedNotCalledOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkerTestDB(t, ctx)
+
+	q, _ := New(db)
+	_ = q.EnsureSchema(ctx)
+
+	registry := NewHandlerRegistry()
+	_ = registry.Register("cb-ok", func(_ context.Context, _ Job) error {
+		return nil // success
+	})
+
+	var called atomic.Bool
+	worker, _ := NewWorker(q, registry, WorkerConfig{
+		PollInterval:      20 * time.Millisecond,
+		ReapInterval:      1 * time.Second,
+		BackoffBase:       10 * time.Millisecond,
+		BackoffMax:        1 * time.Second,
+		BatchSizePerQueue: 10,
+		OnJobFailed: func(_ context.Context, _ Job) {
+			called.Store(true)
+		},
+	})
+
+	_, _ = q.Enqueue(ctx, EnqueueParams{QueueName: "cb-ok", Payload: []byte(`{"x":1}`)})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = worker.Run(runCtx) }()
+
+	// Wait for the job to be processed.
+	requireEventually(t, 4*time.Second, 40*time.Millisecond, func() bool {
+		jobs, err := q.ListJobs(ctx, ListJobsParams{Limit: 1, QueueName: "cb-ok"})
+		return err == nil && len(jobs) == 1 && jobs[0].Status == StatusDone
+	})
+
+	// Callback should NOT have been called.
+	if called.Load() {
+		t.Fatal("OnJobFailed should not be called on success")
+	}
+}
+
 func createWorkerTestDB(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 
