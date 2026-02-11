@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"nanostack.dev/pgkit/pglock"
-	"nanostack.dev/pgkit/pgqueue"
+	"github.com/nanostack-dev/pgkit/pglock"
+	"github.com/nanostack-dev/pgkit/pgqueue"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )

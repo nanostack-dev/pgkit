@@ -1,4 +1,4 @@
-module nanostack.dev/pgkit
+module github.com/nanostack-dev/pgkit
 
 go 1.24.0
 

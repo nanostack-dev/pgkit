@@ -1,6 +1,12 @@
-# nanostack.dev/pgkit
+# github.com/nanostack-dev/pgkit
 
 PostgreSQL primitives for distributed systems in Go.
+
+Install:
+
+```bash
+go get github.com/nanostack-dev/pgkit
+```
 
 ## Packages
 
