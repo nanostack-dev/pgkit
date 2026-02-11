@@ -22,8 +22,6 @@ jobs:
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.8
 
       - name: Run tests
         run: go test -race -count=1 -timeout 10m ./...
