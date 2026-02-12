@@ -42,6 +42,7 @@ type Dashboard struct {
 	tmpl          *template.Template
 	enableEnqueue bool
 	listLimit     int
+	server        *http.Server
 }
 
 // DashboardOptions configures the dashboard.
@@ -148,6 +149,43 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("POST /jobs/{id}/replay", d.requireToken(d.requireCSRF(d.handleReplayJob)))
 	mux.HandleFunc("DELETE /jobs/{id}", d.requireToken(d.requireCSRF(d.handleDeleteJob)))
 	return mux
+}
+
+// ListenAndServe starts the dashboard HTTP server on the given address.
+// If addr is empty, DefaultAdminServerAddr is used.
+// The call blocks until the server is stopped or an error occurs.
+// Use Shutdown to gracefully stop the server.
+func (d *Dashboard) ListenAndServe(addr string) error {
+	if addr == "" {
+		addr = DefaultAdminServerAddr
+	}
+	d.server = &http.Server{
+		Addr:              addr,
+		Handler:           d.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	if err := d.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// Shutdown gracefully shuts down the embedded dashboard server.
+// If no server was started via ListenAndServe, this is a no-op.
+func (d *Dashboard) Shutdown(ctx context.Context) error {
+	if d.server == nil {
+		return nil
+	}
+	return d.server.Shutdown(ctx)
+}
+
+// Addr returns the listen address of the running server, or an empty string
+// if the server has not been started.
+func (d *Dashboard) Addr() string {
+	if d.server == nil {
+		return ""
+	}
+	return d.server.Addr
 }
 
 func (d *Dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
