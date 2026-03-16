@@ -1,4 +1,4 @@
-package pgqueue
+package queue
 
 import (
 	"context"
@@ -63,6 +63,15 @@ type Job struct {
 	LastError   sql.NullString
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+type AdvisoryLock struct {
+	PID         int64  `json:"pid"`
+	Mode        string `json:"mode"`
+	Granted     bool   `json:"granted"`
+	ClassID     int64  `json:"classid"`
+	ObjectID    int64  `json:"objid"`
+	ObjectSubID int64  `json:"objsubid"`
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +174,28 @@ func New(db *sql.DB, hooks ...Hook) (*Client, error) {
 
 // DB returns the underlying *sql.DB for advanced use (e.g. EnqueueTx).
 func (c *Client) DB() *sql.DB { return c.db }
+
+func PayloadPreview(payload []byte) string {
+	return payloadPreview(payload)
+}
+
+func ListAdvisoryLocks(ctx context.Context, client *Client) ([]AdvisoryLock, error) {
+	if client == nil || client.db == nil {
+		return nil, ErrNilDB
+	}
+	return listAdvisoryLocks(ctx, client.db)
+}
+
+func CountDistinctQueues(ctx context.Context, client *Client) (int64, error) {
+	if client == nil || client.db == nil {
+		return 0, ErrNilDB
+	}
+	var total int64
+	if err := client.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT queue_name) FROM pgqueue_jobs`).Scan(&total); err != nil {
+		return 0, fmt.Errorf("queue: count distinct queues: %w", err)
+	}
+	return total, nil
+}
 
 // SetLogger sets a custom logger adapter for client and dashboard events.
 func (c *Client) SetLogger(logger Logger) {
@@ -318,6 +349,10 @@ type queryExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client, _ any) (int64, error) {
 	if p.QueueName == "" {
 		return 0, ErrInvalidQueue
@@ -434,8 +469,22 @@ func (c *Client) Ack(ctx context.Context, id int64) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
+	return ackCore(ctx, c.db, id, c)
+}
 
-	res, err := c.db.ExecContext(ctx,
+// AckTx marks a processing job as done within an existing transaction.
+func (c *Client) AckTx(ctx context.Context, tx *sql.Tx, id int64) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+	if tx == nil {
+		return fmt.Errorf("pgqueue: tx is nil")
+	}
+	return ackCore(ctx, tx, id, c)
+}
+
+func ackCore(ctx context.Context, exec execer, id int64, c *Client) error {
+	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET status = 'done', done_at = NOW(), claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
 		 WHERE id = $1 AND status = 'processing'`,
@@ -449,7 +498,9 @@ func (c *Client) Ack(ctx context.Context, id int64) error {
 		return fmt.Errorf("pgqueue: ack id=%d: %w", id, ErrJobNotFound)
 	}
 
-	c.emit(ctx, EventAck, map[string]any{"id": id})
+	if c != nil {
+		c.emit(ctx, EventAck, map[string]any{"id": id})
+	}
 	return nil
 }
 
@@ -464,7 +515,21 @@ func (c *Client) Retry(ctx context.Context, id int64, delay time.Duration, cause
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
+	return retryCore(ctx, c.db, id, delay, cause, c)
+}
 
+// RetryTx moves a processing job back to pending within an existing transaction.
+func (c *Client) RetryTx(ctx context.Context, tx *sql.Tx, id int64, delay time.Duration, cause error) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+	if tx == nil {
+		return fmt.Errorf("pgqueue: tx is nil")
+	}
+	return retryCore(ctx, tx, id, delay, cause, c)
+}
+
+func retryCore(ctx context.Context, exec execer, id int64, delay time.Duration, cause error, c *Client) error {
 	var errMsg *string
 	if cause != nil {
 		s := cause.Error()
@@ -474,7 +539,7 @@ func (c *Client) Retry(ctx context.Context, id int64, delay time.Duration, cause
 	// Use a single atomic UPDATE that checks state and decides outcome.
 	// If attempts >= max_attempts, move to failed (zombie prevention).
 	// We use DB NOW() + interval for the delay to maintain clock consistency.
-	res, err := c.db.ExecContext(ctx,
+	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
 		     available_at = CASE WHEN attempts >= max_attempts THEN available_at ELSE NOW() + $2::interval END,
@@ -496,7 +561,9 @@ func (c *Client) Retry(ctx context.Context, id int64, delay time.Duration, cause
 		return fmt.Errorf("pgqueue: retry id=%d: %w", id, ErrJobNotFound)
 	}
 
-	c.emit(ctx, EventRetry, map[string]any{"id": id})
+	if c != nil {
+		c.emit(ctx, EventRetry, map[string]any{"id": id})
+	}
 	return nil
 }
 
@@ -510,14 +577,28 @@ func (c *Client) Fail(ctx context.Context, id int64, cause error) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
+	return failCore(ctx, c.db, id, cause, c)
+}
 
+// FailTx marks a processing job as permanently failed within an existing transaction.
+func (c *Client) FailTx(ctx context.Context, tx *sql.Tx, id int64, cause error) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+	if tx == nil {
+		return fmt.Errorf("pgqueue: tx is nil")
+	}
+	return failCore(ctx, tx, id, cause, c)
+}
+
+func failCore(ctx context.Context, exec execer, id int64, cause error, c *Client) error {
 	var errMsg *string
 	if cause != nil {
 		s := cause.Error()
 		errMsg = &s
 	}
 
-	res, err := c.db.ExecContext(ctx,
+	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET status = 'failed',
 		     last_error = $2,
@@ -534,7 +615,9 @@ func (c *Client) Fail(ctx context.Context, id int64, cause error) error {
 		return fmt.Errorf("pgqueue: fail id=%d: %w", id, ErrJobNotFound)
 	}
 
-	c.emit(ctx, EventFail, map[string]any{"id": id})
+	if c != nil {
+		c.emit(ctx, EventFail, map[string]any{"id": id})
+	}
 	return nil
 }
 

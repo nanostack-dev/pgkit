@@ -11,11 +11,14 @@ go get github.com/nanostack-dev/pgkit
 ## Packages
 
 - `pglock`: advisory lock helpers (`transaction` and `session` scoped)
-- `pgqueue`: durable queue with claim/ack/retry/fail/reap and an embedded dashboard
+- `queue`: durable queue with claim/ack/retry/fail/reap
+- `workflow`: durable temporal-style workflows built on top of `queue`
+- `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
+- `fx`: plug-and-play Uber Fx modules for all packages
 
 ## Worker runtime
 
-`pgqueue` includes a worker runtime with queue listeners:
+`queue` includes a worker runtime with queue listeners:
 
 - raw listener: `registry.Register("queue", func(ctx, job){ ... })`
 - typed JSON listener with metadata: `RegisterJSONTyped[T](...)`
@@ -23,9 +26,9 @@ go get github.com/nanostack-dev/pgkit
 
 Worker handles claim loop, ack/retry/fail, and stuck-job reaping.
 
-## pgqueue dashboard
+## Admin UI Dashboard
 
-The dashboard is embedded (HTMX + Tailwind template) and protected with Basic Auth.
+The dashboard is fully embedded (SvelteKit static build + JSON API) and protected with Basic Auth.
 
 Required env var:
 
@@ -33,23 +36,23 @@ Required env var:
 
 Optional env vars:
 
-- `PGKIT_DASHBOARD_ENABLE_API` (`true` by default): enables/disables enqueue endpoints (`/enqueue` and `/api/jobs`)
+- `PGKIT_DASHBOARD_ENABLE_API` (`true` by default): enables/disables mutating endpoints
 
-## Example app
+## Running the Playground
 
-Run the embedded queue dashboard example:
+The easiest way to test out the full pgkit suite (Queue, Workflows, Admin UI) is to run the playground.
+It uses testcontainers to automatically spin up a local PostgreSQL instance, applies all schemas, runs sample background tasks, and starts the Admin UI server.
 
 ```bash
-PGKIT_DATABASE_URL="postgres://pgkit:pgkit@localhost:5432/pgkit_test?sslmode=disable" \
-PGKIT_DASHBOARD_TOKEN="change-me" \
-go run ./cmd/pgkit-example
+cd pgkit
+PGKIT_DASHBOARD_TOKEN="change-me" go run ./cmd/pgkit-playground
 ```
 
 Open `http://localhost:8080` and authenticate with any username + `PGKIT_DASHBOARD_TOKEN` as password.
 
 ## Custom logger adapter
 
-Both `pglock.Client` and `pgqueue.Client` support custom logging adapters:
+`pglock.Client`, `queue.Client`, and `workflow.Module` all support custom logging adapters:
 
 ```go
 type Logger interface {

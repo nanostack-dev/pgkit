@@ -12,8 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nanostack-dev/pgkit/adminui"
 	"github.com/nanostack-dev/pgkit/pglock"
-	"github.com/nanostack-dev/pgkit/pgqueue"
+	qpkg "github.com/nanostack-dev/pgkit/queue"
+	"github.com/nanostack-dev/pgkit/workflow"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -42,7 +44,7 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	queue, err := pgqueue.New(db)
+	queue, err := qpkg.New(db)
 	if err != nil {
 		panic(fmt.Errorf("new queue client: %w", err))
 	}
@@ -50,6 +52,14 @@ func main() {
 
 	if err := queue.EnsureSchema(ctx); err != nil {
 		panic(fmt.Errorf("ensure queue schema: %w", err))
+	}
+
+	workflowModule, err := workflow.New(db, queue)
+	if err != nil {
+		panic(fmt.Errorf("new workflow module: %w", err))
+	}
+	if err := workflowModule.EnsureSchema(ctx); err != nil {
+		panic(fmt.Errorf("ensure workflow schema: %w", err))
 	}
 
 	locker, err := pglock.New(db)
@@ -68,7 +78,7 @@ func main() {
 				return
 			case <-ticker.C:
 				_, _ = locker.TryWithSessionLock(ctx, "pgkit-example-monitor", func(runCtx context.Context) error {
-					jobs, err := queue.ListJobs(runCtx, pgqueue.ListJobsParams{Limit: 1, Status: pgqueue.StatusFailed})
+					jobs, err := queue.ListJobs(runCtx, qpkg.ListJobsParams{Limit: 1, Status: qpkg.StatusFailed})
 					if err != nil {
 						logger.Error("monitor failed", "error", err)
 						return nil
@@ -82,7 +92,7 @@ func main() {
 		}
 	}()
 
-	dashboard, err := pgqueue.NewDashboardFromEnv(queue)
+	dashboard, err := adminui.NewFromEnv(queue, workflowModule)
 	if err != nil {
 		panic(fmt.Errorf("create dashboard: %w (set PGKIT_DASHBOARD_TOKEN)", err))
 	}

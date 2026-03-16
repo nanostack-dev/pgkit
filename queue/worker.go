@@ -1,4 +1,4 @@
-package pgqueue
+package queue
 
 import (
 	"context"
@@ -17,6 +17,23 @@ var (
 	ErrHandlerAlreadySet   = errors.New("pgqueue: handler already registered for queue")
 	ErrInvalidHandler      = errors.New("pgqueue: handler is nil")
 )
+
+// Handled marks a job as already finalized by custom runtime logic.
+// Worker skips Ack/Retry/Fail when this error is returned.
+func Handled() error {
+	return handledError{}
+}
+
+func IsHandled(err error) bool {
+	var target handledError
+	return errors.As(err, &target)
+}
+
+type handledError struct{}
+
+func (handledError) Error() string {
+	return "pgqueue: job already handled"
+}
 
 // NonRetryable wraps an error to mark it as terminal.
 // Worker will fail the job immediately instead of retrying.
@@ -264,6 +281,9 @@ func (w *Worker) runOnce(ctx context.Context) {
 			}
 
 			if err := h(ctx, *job); err != nil {
+				if IsHandled(err) {
+					continue
+				}
 				if IsNonRetryable(err) {
 					if failErr := w.client.Fail(ctx, job.ID, err); failErr != nil {
 						w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})

@@ -1,0 +1,102 @@
+@import 'tailwindcss';
+@import '@skeletonlabs/skeleton';
+@import '@skeletonlabs/skeleton-svelte';
+@import '@skeletonlabs/skeleton/themes/cerberus';
+
+:root {
+	color-scheme: light;
+	--app-shell: 1200px;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+	background:
+		radial-gradient(circle at top left, color-mix(in srgb, var(--color-primary-500) 10%, white) 0%, transparent 35%),
+		radial-gradient(circle at top right, color-mix(in srgb, var(--color-secondary-500) 12%, white) 0%, transparent 28%),
+		linear-gradient(180deg, color-mix(in srgb, var(--color-surface-100) 92%, white) 0%, var(--color-surface-50) 100%);
+	color: var(--color-surface-950);
+	font-family: 'SF Pro Display', 'Inter', 'Segoe UI', sans-serif;
+}
+
+body {
+	min-height: 100vh;
+}
+
+.app-shell {
+	max-width: var(--app-shell);
+	margin: 0 auto;
+	padding: 1.5rem;
+}
+
+.glass-panel {
+	background: color-mix(in srgb, white 78%, var(--color-surface-100));
+	backdrop-filter: blur(18px);
+	border: 1px solid color-mix(in srgb, var(--color-surface-300) 55%, white);
+	box-shadow: 0 18px 60px -28px color-mix(in srgb, var(--color-surface-950) 18%, transparent);
+}
+
+.metric-tile {
+	position: relative;
+	overflow: hidden;
+}
+
+.metric-tile::after {
+	content: '';
+	position: absolute;
+	inset: auto -10% -40% auto;
+	width: 6rem;
+	height: 6rem;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--color-primary-500) 22%, transparent);
+	filter: blur(10px);
+	pointer-events: none;
+}
+
+.status-dot {
+	width: 0.625rem;
+	height: 0.625rem;
+	border-radius: 999px;
+	display: inline-block;
+}
+
+.table-scroll {
+	overflow-x: auto;
+	border-radius: 1rem;
+}
+
+.table-scroll table {
+	min-width: 100%;
+	border-collapse: collapse;
+}
+
+.table-scroll th,
+.table-scroll td {
+	padding: 0.875rem 1rem;
+	white-space: nowrap;
+	border-bottom: 1px solid color-mix(in srgb, var(--color-surface-300) 45%, white);
+	vertical-align: top;
+}
+
+.table-scroll th {
+	font-size: 0.75rem;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+	color: var(--color-surface-600);
+	background: color-mix(in srgb, var(--color-surface-200) 60%, white);
+}
+
+.table-scroll tr:last-child td {
+	border-bottom: 0;
+}
+
+.mono {
+	font-family: 'SF Mono', 'JetBrains Mono', 'Menlo', monospace;
+}
+
+@media (max-width: 768px) {
+	.app-shell {
+		padding: 1rem;
+	}
+}
