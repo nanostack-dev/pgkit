@@ -138,7 +138,7 @@ func buildRunGraphView(run RunRecord, definition DefinitionRecord, graph Graph, 
 	}
 	for _, node := range graph.Nodes {
 		if _, ok := byName[node.ID]; !ok {
-			return nil, fmt.Errorf("%w: run=%s step=%s", ErrRunDefinitionMismatch, run.ID, node.ID)
+			byName[node.ID] = nil
 		}
 	}
 	nodes := make([]RunGraphNodeView, 0, len(graph.Nodes))
@@ -159,9 +159,10 @@ func buildRunGraphView(run RunRecord, definition DefinitionRecord, graph Graph, 
 		}
 		if len(items) == 0 {
 			if root == nil {
-				return nil, fmt.Errorf("%w: run=%s step=%s missing root step row", ErrRunDefinitionMismatch, run.ID, node.ID)
+				nodeView.Status = StepStatusPending
+			} else {
+				nodeView.Status = root.Status
 			}
-			nodeView.Status = root.Status
 		} else {
 			nodeView.Items = items
 			nodeView.Status = aggregateNodeStatus(root, items)
@@ -749,10 +750,10 @@ func scheduleUnlockedDependents(
 		if !ok || len(records) == 0 {
 			continue
 		}
-		if spec.Kind == StepKindForEach {
+		record, ok := findRootStepRecord(records)
+		if !ok {
 			continue
 		}
-		record := records[0]
 		if record.Status != StepStatusPending {
 			continue
 		}
@@ -783,6 +784,15 @@ func scheduleUnlockedDependents(
 		}
 	}
 	return nil
+}
+
+func findRootStepRecord(records []StepRecord) (StepRecord, bool) {
+	for _, record := range records {
+		if record.ItemKey == "" {
+			return record, true
+		}
+	}
+	return StepRecord{}, false
 }
 
 func finalizeRunIfDone(ctx context.Context, tx *sql.Tx, runID string) (bool, error) {

@@ -1,135 +1,146 @@
 <script lang="ts">
-	import { SvelteFlow, Background, Controls, type Node, type Edge, BackgroundVariant } from '@xyflow/svelte';
+	import dagre from '@dagrejs/dagre';
+	import {
+		Background,
+		BackgroundVariant,
+		Controls,
+		MarkerType,
+		Position,
+		SvelteFlow,
+		type Edge,
+		type Node
+	} from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import type { WorkflowRunGraphNode, WorkflowGraphEdge } from '$lib/types';
+	import type { WorkflowGraphEdge, WorkflowRunGraphNode } from '$lib/types';
 	import WorkflowNode from './WorkflowNode.svelte';
 
-	let { nodes: rawNodes, edges: rawEdges } = $props<{ 
-		nodes: WorkflowRunGraphNode[], 
-		edges: WorkflowGraphEdge[] 
+	let { nodes: rawNodes, edges: rawEdges } = $props<{
+		nodes: WorkflowRunGraphNode[];
+		edges: WorkflowGraphEdge[];
 	}>();
 
 	const nodeTypes = {
 		workflowNode: WorkflowNode
 	};
 
-	// Basic DAG layout (top-down) using simple topological sort to calculate ranks
-	function calculateLayout(nodes: WorkflowRunGraphNode[], edges: WorkflowGraphEdge[]) {
-		const result: Node[] = [];
-		const resultEdges: Edge[] = [];
-		
-		// Build adjacency list & indegrees
-		const adj = new Map<string, string[]>();
-		const indegree = new Map<string, number>();
-		
-		nodes.forEach(n => {
-			adj.set(n.node.id, []);
-			indegree.set(n.node.id, 0);
-		});
-		
-		edges.forEach(e => {
-			if (adj.has(e.from) && indegree.has(e.to)) {
-				adj.get(e.from)!.push(e.to);
-				indegree.set(e.to, indegree.get(e.to)! + 1);
-			}
-			
-			resultEdges.push({
-				id: `${e.from}-${e.to}`,
-				source: e.from,
-				target: e.to,
-				animated: true,
-				style: 'stroke: var(--color-surface-400); stroke-width: 2px;'
-			});
+	const NODE_WIDTH = 348;
+	const NODE_HEIGHT = 188;
+	const RANK_SEPARATION = 160;
+	const SIBLING_SEPARATION = 120;
+	const EDGE_PADDING = 20;
+
+	function dagreLayout(nodes: WorkflowRunGraphNode[], edges: WorkflowGraphEdge[]) {
+		const graph = new dagre.graphlib.Graph({ multigraph: false, compound: false });
+		graph.setDefaultEdgeLabel(() => ({}));
+		graph.setGraph({
+			rankdir: 'TB',
+			align: 'UL',
+			ranksep: RANK_SEPARATION,
+			nodesep: SIBLING_SEPARATION,
+			edgesep: EDGE_PADDING,
+			marginx: 24,
+			marginy: 24,
+			acyclicer: 'greedy',
+			ranker: 'tight-tree'
 		});
 
-		// Calculate ranks (topological levels)
-		const ranks = new Map<string, number>();
-		const queue: string[] = [];
-		
-		for (const [id, deg] of indegree.entries()) {
-			if (deg === 0) {
-				queue.push(id);
-				ranks.set(id, 0);
-			}
+		for (const entry of nodes) {
+			const fanoutRows = entry.item_counts.total > 0 ? Math.ceil(entry.item_counts.total / 4) : 0;
+			const derivedHeight = NODE_HEIGHT + fanoutRows * 10;
+			graph.setNode(entry.node.id, {
+				width: NODE_WIDTH,
+				height: derivedHeight
+			});
 		}
 
-		while (queue.length > 0) {
-			const curr = queue.shift()!;
-			const currentRank = ranks.get(curr)!;
-			
-			for (const next of (adj.get(curr) || [])) {
-				indegree.set(next, indegree.get(next)! - 1);
-				ranks.set(next, Math.max(ranks.get(next) || 0, currentRank + 1));
-				
-				if (indegree.get(next) === 0) {
-					queue.push(next);
+		for (const edge of edges) {
+			graph.setEdge(edge.from, edge.to);
+		}
+
+		dagre.layout(graph);
+
+		const incomingCounts = new Map<string, number>();
+		const outgoingCounts = new Map<string, number>();
+		for (const edge of edges) {
+			outgoingCounts.set(edge.from, (outgoingCounts.get(edge.from) ?? 0) + 1);
+			incomingCounts.set(edge.to, (incomingCounts.get(edge.to) ?? 0) + 1);
+		}
+
+		const flowNodes: Node[] = nodes.map((entry) => {
+			const layoutNode = graph.node(entry.node.id);
+			const hasIncoming = (incomingCounts.get(entry.node.id) ?? 0) > 0;
+			const hasOutgoing = (outgoingCounts.get(entry.node.id) ?? 0) > 0;
+			const attemptText = entry.step
+				? `Attempt ${entry.step.attempt}/${entry.step.max_attempts}`
+				: entry.item_counts.total > 0
+					? `${entry.item_counts.total} fan-out items`
+					: 'Awaiting execution';
+
+			return {
+				id: entry.node.id,
+				type: 'workflowNode',
+				targetPosition: hasIncoming ? Position.Top : Position.Left,
+				sourcePosition: hasOutgoing ? Position.Bottom : Position.Right,
+				position: {
+					x: layoutNode.x - layoutNode.width / 2,
+					y: layoutNode.y - layoutNode.height / 2
+				},
+				data: {
+					kind: entry.node.kind,
+					label: entry.node.label,
+					id: entry.node.id,
+					status: entry.status,
+					attemptText,
+					fanout: entry.item_counts,
+					dependsOn: entry.node.depends_on ?? [],
+					queue: entry.node.queue ?? null,
+					maxAttempts: entry.node.max_attempts ?? entry.step?.max_attempts ?? 0,
+					hasIncoming,
+					hasOutgoing
 				}
-			}
-		}
-
-		// Group nodes by rank to calculate X positions
-		const nodesByRank = new Map<number, WorkflowRunGraphNode[]>();
-		nodes.forEach(n => {
-			const r = ranks.get(n.node.id) || 0;
-			if (!nodesByRank.has(r)) nodesByRank.set(r, []);
-			nodesByRank.get(r)!.push(n);
+			};
 		});
 
-		// Generate layout
-		const NODE_WIDTH = 320;
-		const X_SPACING = 380;
-		const Y_SPACING = 200;
+		const flowEdges: Edge[] = edges.map((edge) => ({
+			id: `${edge.from}-${edge.to}`,
+			source: edge.from,
+			target: edge.to,
+			type: 'smoothstep',
+			animated: false,
+			markerEnd: {
+				type: MarkerType.ArrowClosed,
+				width: 18,
+				height: 18,
+				color: 'var(--color-surface-500)'
+			},
+			style: 'stroke: var(--color-surface-500); stroke-width: 2px;'
+		}));
 
-		for (const [rank, rankNodes] of nodesByRank.entries()) {
-			const totalWidth = (rankNodes.length - 1) * X_SPACING;
-			const startX = -totalWidth / 2;
-			
-			rankNodes.forEach((n, idx) => {
-				const attemptText = n.step ? `Attempt ${n.step.attempt}/${n.step.max_attempts}` : 'Not started';
-
-				result.push({
-					id: n.node.id,
-					type: 'workflowNode',
-					position: { x: startX + idx * X_SPACING, y: rank * Y_SPACING },
-					data: { 
-						kind: n.node.kind,
-						label: n.node.label,
-						id: n.node.id,
-						status: n.status,
-						attemptText,
-						fanout: n.item_counts,
-						onRetry: () => {
-							console.log('Retry clicked for node', n.node.id);
-							// TODO: integrate API retry call here
-						}
-					}
-				});
-			});
-		}
-
-		return { flowNodes: result, flowEdges: resultEdges };
+		return { flowNodes, flowEdges };
 	}
 
 	let flowNodes = $state<Node[]>([]);
 	let flowEdges = $state<Edge[]>([]);
 
 	$effect(() => {
-		const layout = calculateLayout(rawNodes, rawEdges);
+		const layout = dagreLayout(rawNodes, rawEdges);
 		flowNodes = layout.flowNodes;
 		flowEdges = layout.flowEdges;
 	});
 </script>
 
-<div class="h-[600px] w-full border border-surface-200/60 rounded-3xl overflow-hidden bg-surface-50 relative shadow-inner">
-	<SvelteFlow 
-		nodes={flowNodes} 
+<div class="relative h-[780px] w-full overflow-hidden rounded-[2rem] border border-surface-200/60 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.92),rgba(240,244,249,0.88)_40%,rgba(229,236,243,0.9)_100%)] shadow-inner">
+	<SvelteFlow
+		nodes={flowNodes}
 		{nodeTypes}
-		edges={flowEdges} 
+		edges={flowEdges}
 		fitView
-		minZoom={0.2}
-		maxZoom={1.5}
+		fitViewOptions={{ padding: 0.14, minZoom: 0.3, maxZoom: 1.1 }}
+		minZoom={0.15}
+		maxZoom={1.6}
+		proOptions={{ hideAttribution: true }}
 	>
-		<Background variant={BackgroundVariant.Dots} gap={20} size={1} />
-		<Controls />
+		<Background variant={BackgroundVariant.Dots} gap={20} size={1.1} />
+		<Controls position="top-right" />
 	</SvelteFlow>
 </div>
