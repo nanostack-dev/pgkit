@@ -109,7 +109,7 @@ func (c *Client) TryWithSessionLock(
 	if err != nil {
 		return false, fmt.Errorf("pglock: get conn: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	lockID := KeyHash(key)
 	var locked bool

@@ -916,7 +916,7 @@ func TestDashboardJSONAPIEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post /api/jobs: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)
 	}
@@ -1048,7 +1048,7 @@ func TestDashboardDisableEnqueueAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post /enqueue: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 404/405 when enqueue disabled, got %d", resp.StatusCode)
 	}
@@ -1065,7 +1065,7 @@ func TestDashboardDisableEnqueueAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post /api/jobs: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 404/405 for /api/jobs when disabled, got %d", resp.StatusCode)
 	}

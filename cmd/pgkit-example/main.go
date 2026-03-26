@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		panic(fmt.Errorf("open db: %w", err))
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
 	if err := db.PingContext(pingCtx); err != nil {

@@ -736,7 +736,7 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	if err != nil {
 		return nil, fmt.Errorf("pgqueue: list jobs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	jobs := make([]Job, 0, p.Limit)
 	for rows.Next() {
@@ -914,13 +914,11 @@ func (c *Client) Purge(ctx context.Context, p PurgeParams) (int64, error) {
 	args := []any{string(p.Status), fmt.Sprintf("%d seconds", int(p.OlderThan.Seconds()))}
 
 	if p.Limit > 0 {
-		query = fmt.Sprintf(
-			`DELETE FROM pgqueue_jobs WHERE id IN (
-				SELECT id FROM pgqueue_jobs
-				WHERE status = $1 AND updated_at < NOW() - $2::interval
-				ORDER BY id ASC LIMIT $3
-			)`, // subquery for LIMIT on DELETE
-		)
+		query = `DELETE FROM pgqueue_jobs WHERE id IN (
+			SELECT id FROM pgqueue_jobs
+			WHERE status = $1 AND updated_at < NOW() - $2::interval
+			ORDER BY id ASC LIMIT $3
+		)` // subquery for LIMIT on DELETE
 		args = append(args, p.Limit)
 	}
 

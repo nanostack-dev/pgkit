@@ -411,7 +411,7 @@ FROM workflow_definitions`, definitionSelectColumns)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: list definitions: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var defs []DefinitionRecord
 	for rows.Next() {
 		record, err := scanDefinition(rows)

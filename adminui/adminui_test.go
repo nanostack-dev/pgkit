@@ -97,7 +97,7 @@ func TestAdminUISnapshotAndWorkflowRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get snapshot: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 snapshot, got %d", resp.StatusCode)
 	}
@@ -121,7 +121,7 @@ func TestAdminUISnapshotAndWorkflowRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get workflow detail: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 workflow detail, got %d", resp.StatusCode)
 	}
@@ -174,7 +174,7 @@ func TestAdminUIRequiresAuthAndSupportsMutations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post mutation: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 mutation, got %d", resp.StatusCode)
 	}

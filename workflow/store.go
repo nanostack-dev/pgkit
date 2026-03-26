@@ -165,7 +165,7 @@ ORDER BY id ASC`, stepSelectColumns), runID)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: list steps by run: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	steps := make([]StepRecord, 0)
 	for rows.Next() {
 		record, err := scanStep(rows)
@@ -213,7 +213,7 @@ ORDER BY created_at DESC LIMIT $%d OFFSET $%d`, runSelectColumns, whereClause, l
 	if err != nil {
 		return nil, fmt.Errorf("workflow: list runs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	runs := make([]RunRecord, 0)
 	for rows.Next() {
 		record, err := scanRun(rows)

@@ -667,7 +667,7 @@ WHERE run_id = $1 AND status = 'succeeded'`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: load step outputs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	state := make(map[string]json.RawMessage)
 	for rows.Next() {
 		var stepName string
@@ -790,7 +790,7 @@ SELECT status FROM workflow_steps WHERE run_id = $1`, runID)
 	if err != nil {
 		return false, fmt.Errorf("workflow: list run statuses: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	allDone := true
 	for rows.Next() {
 		var status StepStatus

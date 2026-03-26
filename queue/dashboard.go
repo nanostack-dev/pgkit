@@ -587,7 +587,7 @@ func listAdvisoryLocks(ctx context.Context, db *sql.DB) ([]AdvisoryLock, error) 
 	if err != nil {
 		return nil, fmt.Errorf("query pg_locks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]AdvisoryLock, 0)
 	for rows.Next() {

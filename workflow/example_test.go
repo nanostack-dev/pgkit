@@ -17,7 +17,7 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	queue, err := qpkg.New(db)
 	if err != nil {
