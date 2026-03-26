@@ -108,9 +108,8 @@ RETURNING id, workflow_definition_id, workflow_name, workflow_version, status, i
 	if err != nil {
 		return nil, fmt.Errorf("workflow: insert run: %w", err)
 	}
-	state := map[string]json.RawMessage{}
 	steps := def.Steps()
-	if err := createRunSteps(ctx, tx, m.queue, runID, inputJSON, steps, state); err != nil {
+	if err := createRunSteps(ctx, tx, m.queue, runID, inputJSON, steps); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -152,7 +151,7 @@ func buildRunGraphView(run RunRecord, definition DefinitionRecord, graph Graph, 
 			return records[i].ItemKey < records[j].ItemKey
 		})
 		nodeView := RunGraphNodeView{Node: node}
-		root, items := splitNodeRecords(records)
+		root, items := splitRootAndItemRecords(records)
 		if root != nil {
 			record := *root
 			nodeView.Step = &record
@@ -181,20 +180,6 @@ func buildRunGraphView(run RunRecord, definition DefinitionRecord, graph Graph, 
 		Edges:      append([]GraphEdge(nil), graph.Edges...),
 		Summary:    summary,
 	}, nil
-}
-
-func splitNodeRecords(records []StepRecord) (*StepRecord, []StepRecord) {
-	var root *StepRecord
-	items := make([]StepRecord, 0, len(records))
-	for _, record := range records {
-		if record.ItemKey == "" && root == nil {
-			copyRecord := record
-			root = &copyRecord
-			continue
-		}
-		items = append(items, record)
-	}
-	return root, items
 }
 
 func aggregateNodeStatus(root *StepRecord, records []StepRecord) StepStatus {
@@ -407,26 +392,8 @@ func (m *Module) executeJob(ctx context.Context, payload jobPayload, job qpkg.Jo
 	if err != nil {
 		return err
 	}
-	stepCtx := StepContext{
-		RunID:        run.ID,
-		WorkflowName: run.WorkflowName,
-		Version:      run.WorkflowVersion,
-		StepName:     step.StepName,
-		ItemKey:      step.ItemKey,
-		Attempt:      step.Attempt + 1,
-		RunInput:     json.RawMessage(run.InputJSON),
-		Input:        json.RawMessage(step.InputJSON),
-		Logger:       m.log,
-		state:        state,
-	}
-	var output any
-	if spec.Kind == StepKindForEach && step.ItemKey == "" {
-		output, err = spec.Resolver(ctx, stepCtx)
-	} else if spec.TxHandler != nil {
-		output, err = spec.TxHandler(ctx, tx, stepCtx)
-	} else {
-		output, err = spec.Handler(ctx, stepCtx)
-	}
+	stepCtx := buildStepExecutionContext(run, step, state, m.log)
+	output, err := executeStepHandler(ctx, tx, spec, stepCtx)
 	if err != nil {
 		if handleErr := m.handleStepFailure(ctx, tx, run, step, spec, job.ID, err, cfg); handleErr != nil {
 			return NonRetryable(handleErr)
@@ -440,23 +407,8 @@ func (m *Module) executeJob(ctx context.Context, payload jobPayload, job qpkg.Jo
 	if err != nil {
 		return NonRetryable(err)
 	}
-	if err := markStepSucceeded(ctx, tx, step.ID, outputJSON); err != nil {
-		return NonRetryable(err)
-	}
-	if spec.Kind == StepKindForEach && step.ItemKey == "" {
-		if err := materializeForEachChildren(ctx, tx, m.queue, run.ID, step, spec, outputJSON); err != nil {
-			return err
-		}
-	}
-	state[step.StepName] = outputJSON
-	if err := scheduleUnlockedDependents(ctx, tx, m.queue, run.ID, def, state); err != nil {
-		return err
-	}
-	completed, err := finalizeRunIfDone(ctx, tx, run.ID)
+	completed, err := m.completeStepSuccess(ctx, tx, run, step, spec, job.ID, outputJSON, def, state)
 	if err != nil {
-		return err
-	}
-	if err := m.queue.AckTx(ctx, tx, job.ID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -468,6 +420,64 @@ func (m *Module) executeJob(ctx context.Context, payload jobPayload, job qpkg.Jo
 	return qpkg.Handled()
 }
 
+func buildStepExecutionContext(run *RunRecord, step *StepRecord, state map[string]json.RawMessage, logger Logger) StepContext {
+	return StepContext{
+		RunID:        run.ID,
+		WorkflowName: run.WorkflowName,
+		Version:      run.WorkflowVersion,
+		StepName:     step.StepName,
+		ItemKey:      step.ItemKey,
+		Attempt:      step.Attempt + 1,
+		RunInput:     json.RawMessage(run.InputJSON),
+		Input:        json.RawMessage(step.InputJSON),
+		Logger:       logger,
+		state:        state,
+	}
+}
+
+func executeStepHandler(ctx context.Context, tx *sql.Tx, spec StepSpec, stepCtx StepContext) (any, error) {
+	if spec.Kind == StepKindForEach && stepCtx.ItemKey == rootStepItemKey {
+		return spec.Resolver(ctx, stepCtx)
+	}
+	if spec.TxHandler != nil {
+		return spec.TxHandler(ctx, tx, stepCtx)
+	}
+	return spec.Handler(ctx, stepCtx)
+}
+
+func (m *Module) completeStepSuccess(
+	ctx context.Context,
+	tx *sql.Tx,
+	run *RunRecord,
+	step *StepRecord,
+	spec StepSpec,
+	queueJobID int64,
+	outputJSON []byte,
+	def *Definition,
+	state map[string]json.RawMessage,
+) (bool, error) {
+	if err := markStepSucceeded(ctx, tx, step.ID, outputJSON); err != nil {
+		return false, NonRetryable(err)
+	}
+	if spec.Kind == StepKindForEach && step.ItemKey == rootStepItemKey {
+		if err := materializeForEachChildren(ctx, tx, m.queue, run.ID, spec, outputJSON); err != nil {
+			return false, err
+		}
+	}
+	rememberStepOutput(state, step.StepName, step.ItemKey, outputJSON)
+	if err := scheduleUnlockedDependents(ctx, tx, m.queue, run.ID, def); err != nil {
+		return false, err
+	}
+	completed, err := finalizeRunIfDone(ctx, tx, run.ID)
+	if err != nil {
+		return false, err
+	}
+	if err := m.queue.AckTx(ctx, tx, queueJobID); err != nil {
+		return false, err
+	}
+	return completed, nil
+}
+
 func createRunSteps(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -475,7 +485,6 @@ func createRunSteps(
 	runID string,
 	inputJSON []byte,
 	steps []StepSpec,
-	state map[string]json.RawMessage,
 ) error {
 	sorted := append([]StepSpec(nil), steps...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
@@ -505,7 +514,6 @@ RETURNING id, run_id, step_name, item_key, step_kind, status, queue_job_id, atte
 			if err := enqueueStep(ctx, tx, queue, record.ID, runID, step.Name, step.RetryPolicy.MaxAttempts); err != nil {
 				return err
 			}
-			state[step.Name] = nil
 		}
 	}
 	return nil
@@ -637,6 +645,9 @@ WHERE id = $1`, stepID); err != nil {
 }
 
 func cancelPendingStepsForRun(ctx context.Context, tx *sql.Tx, runID string, failedStepID int64) error {
+	// Only steps that have not reached a terminal state are cancelled here. This
+	// keeps completed history intact while preventing still-actionable work from
+	// being picked up after the run is already marked failed.
 	if _, err := tx.ExecContext(ctx, `
 UPDATE workflow_steps
 SET status = 'cancelled', completed_at = NOW(), updated_at = NOW()
@@ -665,14 +676,7 @@ WHERE run_id = $1 AND status = 'succeeded'`, runID)
 		if err := rows.Scan(&stepName, &itemKey, &output); err != nil {
 			return nil, fmt.Errorf("workflow: scan step output: %w", err)
 		}
-		key := stepName
-		if itemKey != "" {
-			key = stepName + "[" + itemKey + "]"
-		}
-		state[key] = output
-		if itemKey == "" {
-			state[stepName] = output
-		}
+		rememberStepOutput(state, stepName, itemKey, output)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("workflow: iterate step outputs: %w", err)
@@ -685,7 +689,6 @@ func materializeForEachChildren(
 	tx *sql.Tx,
 	queue *qpkg.Client,
 	runID string,
-	parent *StepRecord,
 	spec StepSpec,
 	outputJSON []byte,
 ) error {
@@ -701,6 +704,9 @@ func materializeForEachChildren(
 			return fmt.Errorf("workflow: marshal foreach dependencies: %w", err)
 		}
 		itemKey := fmt.Sprintf("%06d", idx)
+		// Foreach child rows are unique per (run, step, item). The upsert keeps
+		// materialization idempotent when the parent step is replayed while still
+		// refreshing the child input payload derived from the resolver output.
 		row := tx.QueryRowContext(ctx, `
 INSERT INTO workflow_steps (
     run_id, step_name, item_key, step_kind, status, max_attempts, input_json, dependency_json
@@ -735,7 +741,6 @@ func scheduleUnlockedDependents(
 	queue *qpkg.Client,
 	runID string,
 	def *Definition,
-	state map[string]json.RawMessage,
 ) error {
 	steps, err := listStepsByRun(ctx, tx, runID)
 	if err != nil {
@@ -764,14 +769,7 @@ func scheduleUnlockedDependents(
 				ready = false
 				break
 			}
-			allSucceeded := true
-			for _, depRecord := range depRecords {
-				if depRecord.Status != StepStatusSucceeded {
-					allSucceeded = false
-					break
-				}
-			}
-			if !allSucceeded {
+			if !allStepRecordsSucceeded(depRecords) {
 				ready = false
 				break
 			}
@@ -784,15 +782,6 @@ func scheduleUnlockedDependents(
 		}
 	}
 	return nil
-}
-
-func findRootStepRecord(records []StepRecord) (StepRecord, bool) {
-	for _, record := range records {
-		if record.ItemKey == "" {
-			return record, true
-		}
-	}
-	return StepRecord{}, false
 }
 
 func finalizeRunIfDone(ctx context.Context, tx *sql.Tx, runID string) (bool, error) {

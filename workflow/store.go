@@ -13,6 +13,15 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
+const (
+	definitionSelectColumns = `id, workflow_name, version, status, title, description, graph_json, input_schema_json,
+       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at`
+	runSelectColumns = `id, workflow_definition_id, workflow_name, workflow_version, status, input_json, context_json,
+       started_at, completed_at, created_by, correlation_key, created_at, updated_at`
+	stepSelectColumns = `id, run_id, step_name, item_key, step_kind, status, queue_job_id, attempt, max_attempts, input_json, output_json,
+       error_json, dependency_json, available_at, started_at, completed_at, created_at, updated_at`
+)
+
 func scanDefinition(row scanner) (DefinitionRecord, error) {
 	var record DefinitionRecord
 	if err := row.Scan(
@@ -92,12 +101,11 @@ func scanStep(row scanner) (StepRecord, error) {
 }
 
 func getDefinitionByHash(ctx context.Context, tx *sql.Tx, workflowName, hash string) (*DefinitionRecord, error) {
-	row := tx.QueryRowContext(ctx, `
-SELECT id, workflow_name, version, status, title, description, graph_json, input_schema_json,
-       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_definitions
 WHERE workflow_name = $1 AND content_hash = $2
-LIMIT 1`, workflowName, hash)
+LIMIT 1`, definitionSelectColumns), workflowName, hash)
 	record, err := scanDefinition(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -119,11 +127,10 @@ func nextDefinitionVersion(ctx context.Context, tx *sql.Tx, workflowName string)
 }
 
 func getDefinitionByVersion(ctx context.Context, tx *sql.Tx, workflowName string, version int) (*DefinitionRecord, error) {
-	row := tx.QueryRowContext(ctx, `
-SELECT id, workflow_name, version, status, title, description, graph_json, input_schema_json,
-       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_definitions
-WHERE workflow_name = $1 AND version = $2`, workflowName, version)
+WHERE workflow_name = $1 AND version = $2`, definitionSelectColumns), workflowName, version)
 	record, err := scanDefinition(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -135,11 +142,10 @@ WHERE workflow_name = $1 AND version = $2`, workflowName, version)
 }
 
 func getDefinitionByVersionDB(ctx context.Context, db *sql.DB, workflowName string, version int) (*DefinitionRecord, error) {
-	row := db.QueryRowContext(ctx, `
-SELECT id, workflow_name, version, status, title, description, graph_json, input_schema_json,
-       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_definitions
-WHERE workflow_name = $1 AND version = $2`, workflowName, version)
+WHERE workflow_name = $1 AND version = $2`, definitionSelectColumns), workflowName, version)
 	record, err := scanDefinition(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -151,12 +157,11 @@ WHERE workflow_name = $1 AND version = $2`, workflowName, version)
 }
 
 func listStepsByRun(ctx context.Context, db queryer, runID string) ([]StepRecord, error) {
-	rows, err := db.QueryContext(ctx, `
-SELECT id, run_id, step_name, item_key, step_kind, status, queue_job_id, attempt, max_attempts, input_json, output_json,
-       error_json, dependency_json, available_at, started_at, completed_at, created_at, updated_at
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_steps
 WHERE run_id = $1
-ORDER BY id ASC`, runID)
+ORDER BY id ASC`, stepSelectColumns), runID)
 	if err != nil {
 		return nil, fmt.Errorf("workflow: list steps by run: %w", err)
 	}
@@ -182,11 +187,10 @@ type queryer interface {
 }
 
 func getRunByID(ctx context.Context, db queryer, runID string) (*RunRecord, error) {
-	row := db.QueryRowContext(ctx, `
-SELECT id, workflow_definition_id, workflow_name, workflow_version, status, input_json, context_json,
-       started_at, completed_at, created_by, correlation_key, created_at, updated_at
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_runs
-WHERE id = $1`, runID)
+WHERE id = $1`, runSelectColumns), runID)
 	record, err := scanRun(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -198,43 +202,12 @@ WHERE id = $1`, runID)
 }
 
 func listRuns(ctx context.Context, db *sql.DB, params ListRunsParams) ([]RunRecord, error) {
-	limit := params.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > 100 {
-		limit = 100
-	}
-	offset := params.Offset
-	if offset < 0 {
-		offset = 0
-	}
-	clauses := make([]string, 0, 3)
-	args := make([]any, 0, 5)
-	argIndex := 1
-	if workflowName := strings.TrimSpace(params.WorkflowName); workflowName != "" {
-		clauses = append(clauses, fmt.Sprintf("workflow_name = $%d", argIndex))
-		args = append(args, workflowName)
-		argIndex++
-	}
-	if params.Status != "" {
-		clauses = append(clauses, fmt.Sprintf("status = $%d", argIndex))
-		args = append(args, params.Status)
-		argIndex++
-	}
-	if search := strings.TrimSpace(params.Search); search != "" {
-		clauses = append(clauses, fmt.Sprintf("(workflow_name ILIKE $%d OR id ILIKE $%d OR correlation_key ILIKE $%d OR created_by ILIKE $%d)", argIndex, argIndex, argIndex, argIndex))
-		args = append(args, "%"+search+"%")
-		argIndex++
-	}
-	query := `
-SELECT id, workflow_definition_id, workflow_name, workflow_version, status, input_json, context_json,
-       started_at, completed_at, created_by, correlation_key, created_at, updated_at
-FROM workflow_runs`
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
-	}
-	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+	limit, offset := normalizeRunListPage(params)
+	whereClause, args := buildRunFilterClause(params)
+	query := fmt.Sprintf(`
+SELECT %s
+FROM workflow_runs%s
+ORDER BY created_at DESC LIMIT $%d OFFSET $%d`, runSelectColumns, whereClause, len(args)+1, len(args)+2)
 	args = append(args, limit, offset)
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -256,6 +229,31 @@ FROM workflow_runs`
 }
 
 func countRuns(ctx context.Context, db *sql.DB, params ListRunsParams) (int64, error) {
+	whereClause, args := buildRunFilterClause(params)
+	query := `SELECT COUNT(*) FROM workflow_runs` + whereClause
+	var total int64
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("workflow: count runs: %w", err)
+	}
+	return total, nil
+}
+
+func normalizeRunListPage(params ListRunsParams) (int, int) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := params.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+func buildRunFilterClause(params ListRunsParams) (string, []any) {
 	clauses := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	argIndex := 1
@@ -272,26 +270,22 @@ func countRuns(ctx context.Context, db *sql.DB, params ListRunsParams) (int64, e
 	if search := strings.TrimSpace(params.Search); search != "" {
 		clauses = append(clauses, fmt.Sprintf("(workflow_name ILIKE $%d OR id ILIKE $%d OR correlation_key ILIKE $%d OR created_by ILIKE $%d)", argIndex, argIndex, argIndex, argIndex))
 		args = append(args, "%"+search+"%")
-		argIndex++
 	}
-	query := `SELECT COUNT(*) FROM workflow_runs`
-	if len(clauses) > 0 {
-		query += " WHERE " + strings.Join(clauses, " AND ")
+	if len(clauses) == 0 {
+		return "", args
 	}
-	var total int64
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
-		return 0, fmt.Errorf("workflow: count runs: %w", err)
-	}
-	return total, nil
+	return " WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func getStepByQueueJobID(ctx context.Context, tx *sql.Tx, queueJobID int64) (*StepRecord, error) {
-	row := tx.QueryRowContext(ctx, `
-SELECT id, run_id, step_name, item_key, step_kind, status, queue_job_id, attempt, max_attempts, input_json, output_json,
-       error_json, dependency_json, available_at, started_at, completed_at, created_at, updated_at
+	// Lock the step row while the worker handles the claimed queue job so step
+	// state transitions, retries, and the final ack all observe one consistent
+	// record for this job execution.
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_steps
 WHERE queue_job_id = $1
-FOR UPDATE`, queueJobID)
+FOR UPDATE`, stepSelectColumns), queueJobID)
 	record, err := scanStep(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -303,11 +297,10 @@ FOR UPDATE`, queueJobID)
 }
 
 func getDefinitionByID(ctx context.Context, tx *sql.Tx, definitionID int64) (*DefinitionRecord, error) {
-	row := tx.QueryRowContext(ctx, `
-SELECT id, workflow_name, version, status, title, description, graph_json, input_schema_json,
-       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
 FROM workflow_definitions
-WHERE id = $1`, definitionID)
+WHERE id = $1`, definitionSelectColumns), definitionID)
 	record, err := scanDefinition(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -323,6 +316,9 @@ func updateRunStatus(ctx context.Context, tx *sql.Tx, runID string, status RunSt
 	if completedAt != nil {
 		completed = completedAt.UTC()
 	}
+	// Some callers change run status before the run is terminal. Preserve the
+	// existing completion timestamp unless the caller explicitly provides a new
+	// terminal time.
 	if _, err := tx.ExecContext(ctx, `
 UPDATE workflow_runs
 SET status = $2,

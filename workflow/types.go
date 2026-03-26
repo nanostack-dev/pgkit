@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 )
 
@@ -254,7 +252,7 @@ func (c StepContext) DecodeInput(target any) error {
 }
 
 func (c StepContext) Output(stepName string, target any) error {
-	payload, ok := c.state[stepName]
+	payload, ok := c.state[stepOutputStateKey(stepName, rootStepItemKey)]
 	if !ok || len(payload) == 0 {
 		return fmt.Errorf("%w: %s", ErrStepOutputNotFound, stepName)
 	}
@@ -265,7 +263,7 @@ func (c StepContext) Output(stepName string, target any) error {
 }
 
 func (c StepContext) ItemOutput(stepName, itemKey string, target any) error {
-	key := stepName + "[" + itemKey + "]"
+	key := stepOutputStateKey(stepName, itemKey)
 	payload, ok := c.state[key]
 	if !ok || len(payload) == 0 {
 		return fmt.Errorf("%w: %s", ErrStepOutputNotFound, key)
@@ -277,20 +275,7 @@ func (c StepContext) ItemOutput(stepName, itemKey string, target any) error {
 }
 
 func (c StepContext) ItemOutputs(stepName string) []StepItemOutput {
-	prefix := stepName + "["
-	outputs := make([]StepItemOutput, 0)
-	for key, payload := range c.state {
-		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, "]") {
-			continue
-		}
-		itemKey := strings.TrimSuffix(strings.TrimPrefix(key, prefix), "]")
-		if itemKey == "" {
-			continue
-		}
-		outputs = append(outputs, StepItemOutput{ItemKey: itemKey, Payload: append(json.RawMessage(nil), payload...)})
-	}
-	sort.Slice(outputs, func(i, j int) bool { return outputs[i].ItemKey < outputs[j].ItemKey })
-	return outputs
+	return collectStepItemOutputs(c.state, stepName)
 }
 
 type StepHandler func(ctx context.Context, step StepContext) (any, error)

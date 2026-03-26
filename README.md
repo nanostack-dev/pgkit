@@ -12,7 +12,7 @@ go get github.com/nanostack-dev/pgkit
 
 - `pglock`: advisory lock helpers (`transaction` and `session` scoped)
 - `queue`: durable queue with claim/ack/retry/fail/reap
-- `workflow`: durable temporal-style workflows built on top of `queue`
+- `workflow`: durable temporal-style workflows built on top of `queue` ([docs](workflow/README.md))
 - `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
 - `fx`: plug-and-play Uber Fx modules for all packages
 

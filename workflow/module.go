@@ -289,6 +289,9 @@ func (m *Module) Publish(ctx context.Context, workflowName string) (*PublishResu
 		if err != nil {
 			return nil, err
 		}
+		// nextDefinitionVersion returns the next unused version slot. When every
+		// registered definition is already published, the current latest record is
+		// therefore one version behind that value.
 		latest, err := getDefinitionByVersion(ctx, tx, workflowName, latestVersion-1)
 		if err != nil {
 			return nil, err
@@ -352,6 +355,9 @@ func (m *Module) Activate(ctx context.Context, workflowName string, version int)
 		return err
 	}
 	nowStatus := DefinitionStatusActive
+	// Promote the requested version and deprecate any previously active or draft
+	// versions in a single statement so readers never observe two active
+	// definitions for the same workflow name.
 	if _, err := tx.ExecContext(ctx, `
 UPDATE workflow_definitions
 SET status = CASE WHEN id = $1 THEN 'active' ELSE 'deprecated' END,
@@ -376,12 +382,11 @@ ON CONFLICT (workflow_name) DO UPDATE SET active_definition_id = EXCLUDED.active
 }
 
 func (m *Module) GetActiveDefinition(ctx context.Context, workflowName string) (*DefinitionRecord, error) {
-	row := m.db.QueryRowContext(ctx, `
-SELECT d.id, d.workflow_name, d.version, d.status, d.title, d.description, d.graph_json, d.input_schema_json,
-       d.metadata_json, d.content_hash, d.created_at, d.activated_at, d.deprecated_at, d.retired_at
+	row := m.db.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT d.%s
 FROM workflow_definition_aliases a
 JOIN workflow_definitions d ON d.id = a.active_definition_id
-WHERE a.workflow_name = $1`, workflowName)
+WHERE a.workflow_name = $1`, strings.ReplaceAll(definitionSelectColumns, ", ", ", d.")), workflowName)
 	record, err := scanDefinition(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -393,10 +398,9 @@ WHERE a.workflow_name = $1`, workflowName)
 }
 
 func (m *Module) ListDefinitions(ctx context.Context, workflowName string) ([]DefinitionRecord, error) {
-	query := `
-SELECT id, workflow_name, version, status, title, description, graph_json, input_schema_json,
-       metadata_json, content_hash, created_at, activated_at, deprecated_at, retired_at
-FROM workflow_definitions`
+	query := fmt.Sprintf(`
+SELECT %s
+FROM workflow_definitions`, definitionSelectColumns)
 	args := []any{}
 	if strings.TrimSpace(workflowName) != "" {
 		query += ` WHERE workflow_name = $1`
