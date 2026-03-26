@@ -1,4 +1,4 @@
-package pgqueue
+package queue
 
 import (
 	"context"
@@ -573,7 +573,7 @@ func nullStringOrDash(v sql.NullString) string {
 	return v.String
 }
 
-func listAdvisoryLocks(ctx context.Context, db *sql.DB) ([]map[string]any, error) {
+func listAdvisoryLocks(ctx context.Context, db *sql.DB) ([]AdvisoryLock, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
@@ -589,7 +589,7 @@ func listAdvisoryLocks(ctx context.Context, db *sql.DB) ([]map[string]any, error
 	}
 	defer rows.Close()
 
-	out := make([]map[string]any, 0)
+	out := make([]AdvisoryLock, 0)
 	for rows.Next() {
 		var pid int64
 		var mode string
@@ -600,13 +600,13 @@ func listAdvisoryLocks(ctx context.Context, db *sql.DB) ([]map[string]any, error
 		if err := rows.Scan(&pid, &mode, &granted, &classID, &objID, &objSubID); err != nil {
 			return nil, fmt.Errorf("scan pg_locks: %w", err)
 		}
-		out = append(out, map[string]any{
-			"pid":      pid,
-			"mode":     mode,
-			"granted":  granted,
-			"classid":  classID,
-			"objid":    objID,
-			"objsubid": objSubID,
+		out = append(out, AdvisoryLock{
+			PID:         pid,
+			Mode:        mode,
+			Granted:     granted,
+			ClassID:     classID,
+			ObjectID:    objID,
+			ObjectSubID: objSubID,
 		})
 	}
 	if err := rows.Err(); err != nil {

@@ -21,6 +21,10 @@ dist/
 build/
 tmp/
 
+# Keep the embedded admin UI build in source control.
+!adminui/dist/
+!adminui/dist/**
+
 # IDE/editor
 .idea/
 *.iml
