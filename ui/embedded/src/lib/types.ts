@@ -185,3 +185,6 @@ export type DashboardSnapshot = {
 		runs: WorkflowRunsResponse;
 	};
 };
+
+export type WorkflowRetryRunResponse = WorkflowRun;
+export type WorkflowRetryStepResponse = WorkflowStepRecord;

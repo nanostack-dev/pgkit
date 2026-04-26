@@ -34,6 +34,32 @@ async function getJSON<T>(input: string): Promise<T> {
 	return (await response.json()) as T;
 }
 
+async function mutateJSON<T>(input: string, init?: RequestInit): Promise<T> {
+	const response = await fetch(input, {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: {
+			accept: 'application/json',
+			'X-Requested-With': 'pgkit-admin-ui',
+			...(init?.headers ?? {})
+		},
+		...init
+	});
+	if (!response.ok) {
+		let message = `Request failed: ${response.status}`;
+		try {
+			const data = (await response.json()) as { error?: string };
+			if (data.error) {
+				message = data.error;
+			}
+		} catch {
+			// ignore response decode failure
+		}
+		throw new Error(message);
+	}
+	return (await response.json()) as T;
+}
+
 export function getSnapshot(): Promise<DashboardSnapshot> {
 	return getJSON<DashboardSnapshot>('/api/dashboard/snapshot');
 }
@@ -68,4 +94,16 @@ export function getWorkflowRuns(filters: {
 
 export function getWorkflowRun(runID: string): Promise<WorkflowRunGraphView> {
 	return getJSON<WorkflowRunGraphView>(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}`);
+}
+
+export function replayQueueJob(jobID: number): Promise<void> {
+	return mutateJSON<unknown>(`/api/dashboard/queue/jobs/${jobID}/replay`).then(() => undefined);
+}
+
+export function retryWorkflowRun(runID: string) {
+	return mutateJSON(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}/retry`);
+}
+
+export function retryWorkflowStep(stepID: number) {
+	return mutateJSON(`/api/dashboard/workflow/steps/${stepID}/retry`);
 }

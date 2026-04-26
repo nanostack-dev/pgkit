@@ -444,6 +444,117 @@ func (m *Module) CountRuns(ctx context.Context, params ListRunsParams) (int64, e
 	return countRuns(ctx, m.db, params)
 }
 
+// RetryRun starts a new run using the original run input and metadata.
+// Only failed or cancelled runs are retryable.
+func (m *Module) RetryRun(ctx context.Context, runID string) (*RunRecord, error) {
+	if m == nil || m.db == nil {
+		return nil, ErrNilDB
+	}
+
+	run, err := getRunByID(ctx, m.db, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	if run.Status != RunStatusFailed && run.Status != RunStatusCancelled {
+		return nil, fmt.Errorf("%w: %s status=%s", ErrRunNotRetryable, run.ID, run.Status)
+	}
+
+	var opts StartRunOptions
+	if run.CreatedBy.Valid {
+		opts.CreatedBy = run.CreatedBy.String
+	}
+	if run.CorrelationKey.Valid {
+		opts.CorrelationKey = run.CorrelationKey.String
+	}
+	if len(run.ContextJSON) > 0 {
+		opts.ContextJSON = append([]byte(nil), run.ContextJSON...)
+	}
+
+	return m.StartVersion(ctx, run.WorkflowName, run.WorkflowVersion, json.RawMessage(run.InputJSON), &opts)
+}
+
+// RetryStep replays the queue work for a failed or cancelled step inside an existing run.
+func (m *Module) RetryStep(ctx context.Context, stepID int64) (*StepRecord, error) {
+	if m == nil || m.db == nil {
+		return nil, ErrNilDB
+	}
+	if m.queue == nil {
+		return nil, ErrNilQueue
+	}
+
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("workflow: begin retry step tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	step, err := getStepByID(ctx, tx, stepID)
+	if err != nil {
+		return nil, err
+	}
+	run, err := getRunByID(ctx, tx, step.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if step.Status != StepStatusFailed && step.Status != StepStatusCancelled {
+		return nil, fmt.Errorf("%w: %d status=%s", ErrStepNotRetryable, step.ID, step.Status)
+	}
+
+	defRecord, err := getDefinitionByID(ctx, tx, run.WorkflowDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	def, err := m.resolveDefinitionByRecord(defRecord)
+	if err != nil {
+		return nil, err
+	}
+	spec, ok := def.Step(step.StepName)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrStepNotFound, step.StepName)
+	}
+
+	if err := updateRunStatus(ctx, tx, run.ID, RunStatusRunning, nil); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE workflow_steps
+SET status = 'pending',
+    error_json = NULL,
+    output_json = NULL,
+    started_at = NULL,
+    completed_at = NULL,
+    available_at = NULL,
+    updated_at = NOW()
+WHERE id = $1`, step.ID); err != nil {
+		return nil, fmt.Errorf("workflow: reset step for retry: %w", err)
+	}
+
+	if step.QueueJobID.Valid {
+		if err := m.queue.ReplayJobTx(ctx, tx, step.QueueJobID.Int64); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE workflow_steps
+SET status = 'queued', available_at = NOW(), updated_at = NOW()
+WHERE id = $1`, step.ID); err != nil {
+			return nil, fmt.Errorf("workflow: mark step queued on replay: %w", err)
+		}
+	} else {
+		if err := enqueueStepWithItem(ctx, tx, m.queue, step.ID, step.RunID, step.StepName, step.ItemKey, spec.RetryPolicy.MaxAttempts); err != nil {
+			return nil, err
+		}
+	}
+
+	updated, err := getStepByID(ctx, tx, step.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("workflow: commit retry step tx: %w", err)
+	}
+	return updated, nil
+}
+
 func (m *Module) DiffDefinitionVersions(ctx context.Context, workflowName string, fromVersion, toVersion int) (*GraphDiff, error) {
 	from, err := m.GetDefinitionVersion(ctx, workflowName, fromVersion)
 	if err != nil {

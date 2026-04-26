@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { invalidateAll } from '$app/navigation';
+	import { retryWorkflowRun, retryWorkflowStep } from '$lib/api';
 	import { formatDateTime, prettyJSON } from '$lib/format';
 	import { workflowRunTone, workflowStepTone } from '$lib/status';
 	import type { WorkflowRunGraphNode, WorkflowRunGraphView } from '$lib/types';
@@ -6,12 +8,41 @@
 	import Graph from '$lib/Graph.svelte';
 
 	let { data } = $props<{ data: { runGraph: WorkflowRunGraphView } }>();
+	let retryingRun = $state(false);
+	let retryingStepID = $state<number | null>(null);
+let actionError = $state('');
 
 	function nodeChildren(node: WorkflowRunGraphNode) {
 		return node.items ?? [];
 	}
 
 	let viewMode = $state<'graph' | 'list'>('graph');
+
+	async function retryRun() {
+		retryingRun = true;
+		actionError = '';
+		try {
+			await retryWorkflowRun(data.runGraph.run.id);
+			await invalidateAll();
+		} catch (err) {
+			actionError = err instanceof Error ? err.message : 'Failed to retry run.';
+		} finally {
+			retryingRun = false;
+		}
+	}
+
+	async function retryStep(stepID: number) {
+		retryingStepID = stepID;
+		actionError = '';
+		try {
+			await retryWorkflowStep(stepID);
+			await invalidateAll();
+		} catch (err) {
+			actionError = err instanceof Error ? err.message : 'Failed to retry step.';
+		} finally {
+			retryingStepID = null;
+		}
+	}
 </script>
 
 <div class="mb-6">
@@ -50,7 +81,25 @@
 			{data.runGraph.run.status}
 		</div>
 	</div>
+	{#if data.runGraph.run.status === 'failed' || data.runGraph.run.status === 'cancelled'}
+		<div class="mt-4">
+			<button
+				class="inline-flex items-center gap-2 rounded-xl border border-surface-200 bg-white px-4 py-2 text-sm font-medium text-surface-700 transition-colors hover:bg-surface-50 disabled:opacity-50"
+				onclick={retryRun}
+				disabled={retryingRun}
+			>
+				<RotateCwIcon class={`size-4 ${retryingRun ? 'animate-spin' : ''}`} />
+				Retry Run
+			</button>
+		</div>
+	{/if}
 </div>
+
+{#if actionError}
+	<div class="mb-6 rounded-xl border border-error-200 bg-error-50 px-4 py-3 text-sm text-error-800">
+		{actionError}
+	</div>
+{/if}
 
 <div class="grid lg:grid-cols-4 gap-6 mb-8">
 	<!-- Summary Stats -->
@@ -169,6 +218,18 @@
 						{/if}
 
 						{#if node.step}
+							{#if node.step.status === 'failed' || node.step.status === 'cancelled'}
+								<div class="mt-4">
+									<button
+										class="inline-flex items-center gap-2 rounded-lg border border-surface-200 bg-white px-3 py-2 text-xs font-medium text-surface-700 transition-colors hover:bg-surface-50 disabled:opacity-50"
+										onclick={() => retryStep(node.step!.id)}
+										disabled={retryingStepID === node.step.id}
+									>
+										<RotateCwIcon class={`size-3.5 ${retryingStepID === node.step.id ? 'animate-spin' : ''}`} />
+										Retry Step
+									</button>
+								</div>
+							{/if}
 							<div class="mt-4 grid gap-3 xl:grid-cols-2">
 								<div class="flex flex-col">
 									<p class="mb-1.5 text-[0.65rem] font-bold text-surface-400 uppercase tracking-wider">Input</p>

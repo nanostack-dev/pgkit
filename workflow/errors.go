@@ -17,6 +17,8 @@ var (
 	ErrInvalidWorkerConfig       = errors.New("workflow: invalid worker config")
 	ErrRunNotFound               = errors.New("workflow: run not found")
 	ErrStepNotFound              = errors.New("workflow: step not found")
+	ErrRunNotRetryable           = errors.New("workflow: run is not retryable")
+	ErrStepNotRetryable          = errors.New("workflow: step is not retryable")
 	ErrStepNotRunnable           = errors.New("workflow: step is not runnable")
 	ErrStepOutputNotFound        = errors.New("workflow: step output not found")
 	ErrRunDefinitionMismatch     = errors.New("workflow: run definition graph mismatch")

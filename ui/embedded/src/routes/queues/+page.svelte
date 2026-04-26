@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getQueueJobs, getQueueLocks, getQueueSummary } from '$lib/api';
+	import { getQueueJobs, getQueueLocks, getQueueSummary, replayQueueJob } from '$lib/api';
 	import { formatDateTime, formatRelative } from '$lib/format';
 	import { queueStatusTone } from '$lib/status';
 	import type { QueueJob, QueueLock, QueueSummary } from '$lib/types';
@@ -29,6 +29,7 @@
 	let total = $state(0);
 	const limit = 20;
 	let offset = $state(0);
+	let replayingJobID = $state<number | null>(null);
 
 	async function refresh() {
 		loading = true;
@@ -59,6 +60,19 @@
 	function move(delta: number) {
 		offset = Math.max(0, offset + delta);
 		void refresh();
+	}
+
+	async function replayJob(jobID: number) {
+		replayingJobID = jobID;
+		error = '';
+		try {
+			await replayQueueJob(jobID);
+			await refresh();
+		} catch (err) {
+			error = err instanceof Error ? err.message : 'Failed to replay queue job.';
+		} finally {
+			replayingJobID = null;
+		}
 	}
 
 	onMount(() => {
@@ -185,16 +199,17 @@
 					<th class="px-6 py-4 font-semibold">Claimed By</th>
 					<th class="px-6 py-4 font-semibold max-w-[200px]">Payload</th>
 					<th class="px-6 py-4 font-semibold max-w-[200px]">Last Error</th>
+					<th class="px-6 py-4 font-semibold text-right">Actions</th>
 				</tr>
 			</thead>
 			<tbody class="divide-y divide-surface-200/40 text-sm">
 				{#if loading && jobs.length === 0}
-					<tr><td colspan="8" class="px-6 py-12 text-center text-surface-400">
+					<tr><td colspan="9" class="px-6 py-12 text-center text-surface-400">
 						<RefreshCwIcon class="size-6 animate-spin mx-auto mb-2 opacity-50" />
 						Loading queue snapshot...
 					</td></tr>
 				{:else if jobs.length === 0}
-					<tr><td colspan="8" class="px-6 py-16 text-center text-surface-500">
+					<tr><td colspan="9" class="px-6 py-16 text-center text-surface-500">
 						<div class="flex flex-col items-center justify-center gap-3">
 							<div class="bg-surface-100 p-3 rounded-full"><SearchIcon class="size-6 text-surface-400" /></div>
 							<p>No jobs match this filter set.</p>
@@ -242,6 +257,20 @@
 									<div class="max-w-[200px] truncate text-[0.7rem] text-error-600 font-medium" title={job.last_error}>{job.last_error}</div>
 								{:else}
 									<span class="text-surface-400">-</span>
+								{/if}
+							</td>
+							<td class="px-6 py-4 text-right">
+								{#if job.status === 'failed' || job.status === 'done'}
+									<button
+										class="inline-flex items-center gap-1.5 rounded-lg border border-surface-200 bg-white px-3 py-1.5 text-xs font-medium text-surface-700 transition-colors hover:bg-surface-50 disabled:opacity-50"
+										onclick={() => replayJob(job.id)}
+										disabled={replayingJobID === job.id}
+									>
+										<RefreshCwIcon class={`size-3.5 ${replayingJobID === job.id ? 'animate-spin' : ''}`} />
+										Replay
+									</button>
+								{:else}
+									<span class="text-surface-300">-</span>
 								{/if}
 							</td>
 						</tr>

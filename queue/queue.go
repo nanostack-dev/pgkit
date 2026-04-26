@@ -832,8 +832,21 @@ func (c *Client) ReplayJob(ctx context.Context, id int64) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
+	return c.ReplayJobTx(ctx, nil, id)
+}
 
-	res, err := c.db.ExecContext(ctx,
+// ReplayJobTx resets a done/failed job to pending and clears runtime state within an optional transaction.
+func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+
+	var exec execer = c.db
+	if tx != nil {
+		exec = tx
+	}
+
+	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
          SET status = 'pending',
              attempts = 0,

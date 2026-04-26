@@ -236,6 +236,8 @@ func (u *UI) Handler() http.Handler {
 		mux.HandleFunc("POST /api/dashboard/queue/jobs", u.requireToken(u.requireCSRF(u.handleEnqueueJob)))
 		mux.HandleFunc("POST /api/dashboard/queue/jobs/{id}/replay", u.requireToken(u.requireCSRF(u.handleReplayJob)))
 		mux.HandleFunc("DELETE /api/dashboard/queue/jobs/{id}", u.requireToken(u.requireCSRF(u.handleDeleteJob)))
+		mux.HandleFunc("POST /api/dashboard/workflow/runs/{id}/retry", u.requireToken(u.requireCSRF(u.handleRetryWorkflowRun)))
+		mux.HandleFunc("POST /api/dashboard/workflow/steps/{id}/retry", u.requireToken(u.requireCSRF(u.handleRetryWorkflowStep)))
 	}
 	fileServer := http.FileServer(http.FS(u.assets))
 	mux.Handle("GET /_app/", u.requireToken(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +428,56 @@ func (u *UI) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (u *UI) handleRetryWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	if u.workflow == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	run, err := u.workflow.RetryRun(r.Context(), strings.TrimSpace(r.PathValue("id")))
+	if err != nil {
+		switch {
+		case errors.Is(err, workflow.ErrRunNotFound):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, workflow.ErrRunNotRetryable):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toWorkflowRun(*run))
+}
+
+func (u *UI) handleRetryWorkflowStep(w http.ResponseWriter, r *http.Request) {
+	if u.workflow == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	id, ok := parsePathID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid step id"))
+		return
+	}
+
+	step, err := u.workflow.RetryStep(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, workflow.ErrStepNotFound):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, workflow.ErrStepNotRetryable):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toWorkflowStep(*step))
 }
 
 func (u *UI) handleSPA(w http.ResponseWriter, _ *http.Request) {

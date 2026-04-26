@@ -201,6 +201,21 @@ WHERE id = $1`, runSelectColumns), runID)
 	return &record, nil
 }
 
+func getStepByID(ctx context.Context, db queryer, stepID int64) (*StepRecord, error) {
+	row := db.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT %s
+FROM workflow_steps
+WHERE id = $1`, stepSelectColumns), stepID)
+	record, err := scanStep(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("%w: id=%d", ErrStepNotFound, stepID)
+		}
+		return nil, fmt.Errorf("workflow: get step by id: %w", err)
+	}
+	return &record, nil
+}
+
 func listRuns(ctx context.Context, db *sql.DB, params ListRunsParams) ([]RunRecord, error) {
 	limit, offset := normalizeRunListPage(params)
 	whereClause, args := buildRunFilterClause(params)
