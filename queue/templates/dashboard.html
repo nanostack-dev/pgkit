@@ -1,0 +1,227 @@
+{{define "dashboard.html"}}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PGKit Queue Admin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+      :root {
+        --bg: #f7f8fb;
+        --card: #ffffff;
+        --ink: #0f172a;
+      }
+      body {
+        background: radial-gradient(circle at 10% -20%, #e2ecff 0%, transparent 45%),
+                    radial-gradient(circle at 100% 0%, #d7f3ea 0%, transparent 35%),
+                    var(--bg);
+        color: var(--ink);
+      }
+      .htmx-indicator { opacity: 0; transition: opacity 120ms ease; }
+      .htmx-request .htmx-indicator { opacity: 1; }
+      .htmx-request.htmx-indicator { opacity: 1; }
+      tr.htmx-swapping td { opacity: 0.45; transition: opacity 120ms ease; }
+    </style>
+  </head>
+  <body class="min-h-screen font-[system-ui]">
+    <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+      <section class="mb-6 rounded-2xl bg-white/85 p-6 shadow-sm ring-1 ring-slate-200/70 backdrop-blur">
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">PGKit</p>
+            <h1 class="mt-1 text-2xl font-semibold tracking-tight sm:text-3xl">Queue Admin Console</h1>
+            <p class="mt-2 text-sm text-slate-600">Manage jobs safely, replay failed work, and inspect queue locks in real-time.</p>
+          </div>
+          <div class="rounded-full bg-emerald-100 px-3 py-1 text-sm font-medium text-emerald-800">Live</div>
+        </div>
+      </section>
+
+      {{if .can_enqueue}}
+      <section class="mb-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200/70">
+        <h2 class="mb-4 text-lg font-semibold">Enqueue Job</h2>
+        <form hx-post="/enqueue" hx-target="#enqueue-result" hx-swap="innerHTML" class="grid gap-3 md:grid-cols-4">
+          <input name="queue" placeholder="queue name" class="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" required />
+          <input name="payload" placeholder='payload (json/text)' class="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" required />
+          <input name="max_attempts" type="number" min="1" value="5" class="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" />
+          <input name="delay_seconds" type="number" min="0" value="0" class="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" />
+          <button type="submit" class="col-span-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-700">Enqueue</button>
+        </form>
+        <p class="mt-2 text-xs text-slate-500">JSON API: <code class="rounded bg-slate-100 px-1">POST /api/jobs</code></p>
+        <div id="enqueue-result" class="mt-2 text-sm"></div>
+      </section>
+      {{end}}
+
+      <section class="mb-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200/70">
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 class="text-lg font-semibold">Jobs</h2>
+          <span class="text-xs text-slate-500">Auto-refresh 2s</span>
+        </div>
+
+        <form id="jobs-filters" class="mb-4 grid gap-2 md:grid-cols-12"
+          hx-get="/fragment/jobs"
+          hx-target="#jobs"
+          hx-swap="innerHTML"
+          hx-trigger="submit, input delay:500ms changed from:#search"
+          hx-include="#jobs-filters"
+        >
+          <input id="search" name="search" placeholder="Search queue, payload, or error" maxlength="256"
+            class="md:col-span-6 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" />
+          <input name="queue" placeholder="Queue" class="md:col-span-3 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm" />
+          <select name="status" class="md:col-span-2 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm">
+            <option value="">All status</option>
+            <option value="pending">pending</option>
+            <option value="processing">processing</option>
+            <option value="done">done</option>
+            <option value="failed">failed</option>
+          </select>
+          <input type="hidden" name="limit" value="{{.limit}}" />
+          <button type="submit" class="md:col-span-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100">Filter</button>
+        </form>
+
+        <div id="jobs" hx-get="/fragment/jobs?limit={{.limit}}" hx-trigger="load, every 2s" hx-include="#jobs-filters" hx-swap="innerHTML"></div>
+      </section>
+
+      <section class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200/70">
+        <div class="mb-3 flex items-center justify-between">
+          <h2 class="text-lg font-semibold">Advisory Locks</h2>
+          <span class="text-xs text-slate-500">Auto-refresh 2s</span>
+        </div>
+        <div id="locks" hx-get="/fragment/locks" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+      </section>
+    </main>
+  </body>
+</html>
+{{end}}
+
+{{define "jobs_fragment"}}
+<div class="overflow-hidden rounded-xl border border-slate-200">
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-left text-sm">
+      <thead class="bg-slate-100 text-xs uppercase tracking-wide text-slate-600">
+        <tr>
+          <th class="px-3 py-2">ID</th>
+          <th class="px-3 py-2">Queue</th>
+          <th class="px-3 py-2">Status</th>
+          <th class="px-3 py-2">Attempts</th>
+          <th class="px-3 py-2">Available</th>
+          <th class="px-3 py-2">Claimed By</th>
+          <th class="px-3 py-2">Payload</th>
+          <th class="px-3 py-2">Last Error</th>
+          <th class="px-3 py-2 text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .rows}}
+          {{template "job_row" .}}
+        {{else}}
+          <tr><td colspan="9" class="px-3 py-6 text-center text-slate-500">No jobs match your filters</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="mt-3 flex items-center justify-between">
+  <p class="text-xs text-slate-500">{{.total}} total jobs</p>
+  <div class="flex items-center gap-2">
+    {{if .has_prev}}
+      <button
+        class="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs hover:bg-slate-100"
+        hx-get="/fragment/jobs"
+        hx-target="#jobs"
+        hx-swap="innerHTML"
+        hx-include="#jobs-filters"
+        hx-vals='{"offset": {{.prev_offset}}, "limit": {{.limit}} }'
+      >Prev</button>
+    {{else}}
+      <span class="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-400">Prev</span>
+    {{end}}
+    <span class="text-xs text-slate-600">offset {{.offset}}</span>
+    {{if .has_next}}
+      <button
+        class="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs hover:bg-slate-100"
+        hx-get="/fragment/jobs"
+        hx-target="#jobs"
+        hx-swap="innerHTML"
+        hx-include="#jobs-filters"
+        hx-vals='{"offset": {{.next_offset}}, "limit": {{.limit}} }'
+      >Next</button>
+    {{else}}
+      <span class="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs text-slate-400">Next</span>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+{{define "job_row"}}
+<tr id="job-row-{{.ID}}" class="border-b border-slate-100 bg-white">
+  <td class="px-3 py-2 font-mono text-xs text-slate-700">{{.ID}}</td>
+  <td class="px-3 py-2 text-slate-800">{{.Queue}}</td>
+  <td class="px-3 py-2">
+    <span class="rounded-full px-2 py-0.5 text-xs font-medium
+      {{if eq .Status "done"}}bg-emerald-100 text-emerald-800{{else if eq .Status "failed"}}bg-rose-100 text-rose-800{{else if eq .Status "processing"}}bg-amber-100 text-amber-800{{else}}bg-sky-100 text-sky-800{{end}}">
+      {{.Status}}
+    </span>
+  </td>
+  <td class="px-3 py-2 text-slate-700">{{.Attempts}}</td>
+  <td class="px-3 py-2 font-mono text-xs text-slate-600">{{.AvailableAt}}</td>
+  <td class="px-3 py-2 text-slate-700">{{.ClaimedBy}}</td>
+  <td class="max-w-xs truncate px-3 py-2 font-mono text-xs text-slate-700" title="{{.Payload}}">{{.Payload}}</td>
+  <td class="max-w-xs truncate px-3 py-2 text-xs text-rose-700" title="{{.LastError}}">{{.LastError}}</td>
+  <td class="px-3 py-2 text-right">
+    <div class="inline-flex items-center gap-2">
+      <button
+        class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+        {{if not .CanReplay}}disabled{{end}}
+        hx-post="/jobs/{{.ID}}/replay"
+        hx-target="#job-row-{{.ID}}"
+        hx-swap="outerHTML"
+        hx-confirm="Replay this job?"
+      >Replay</button>
+      <button
+        class="rounded-md border border-rose-300 bg-white px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+        {{if not .CanDelete}}disabled{{end}}
+        hx-delete="/jobs/{{.ID}}"
+        hx-target="#job-row-{{.ID}}"
+        hx-swap="delete"
+        hx-confirm="Delete this job? This cannot be undone."
+      >Delete</button>
+    </div>
+  </td>
+</tr>
+{{end}}
+
+{{define "locks_fragment"}}
+<div class="overflow-hidden rounded-xl border border-slate-200">
+  <div class="overflow-x-auto">
+    <table class="min-w-full text-left text-sm">
+      <thead class="bg-slate-100 text-xs uppercase tracking-wide text-slate-600">
+        <tr>
+          <th class="px-3 py-2">PID</th>
+          <th class="px-3 py-2">Mode</th>
+          <th class="px-3 py-2">Granted</th>
+          <th class="px-3 py-2">ClassID</th>
+          <th class="px-3 py-2">ObjID</th>
+          <th class="px-3 py-2">ObjSubID</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .rows}}
+        <tr class="border-b border-slate-100">
+          <td class="px-3 py-2">{{.pid}}</td>
+          <td class="px-3 py-2">{{.mode}}</td>
+          <td class="px-3 py-2">{{.granted}}</td>
+          <td class="px-3 py-2">{{.classid}}</td>
+          <td class="px-3 py-2">{{.objid}}</td>
+          <td class="px-3 py-2">{{.objsubid}}</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="6" class="px-3 py-6 text-center text-slate-500">No advisory locks</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}

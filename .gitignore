@@ -1,0 +1,42 @@
+# OS files
+.DS_Store
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+coverage.out
+*.coverprofile
+*.prof
+
+# Build/output directories
+bin/
+dist/
+build/
+tmp/
+
+# Root-level local binaries
+/pgkit-example
+/pgkit-playground
+
+# Keep the embedded admin UI build in source control.
+!adminui/dist/
+!adminui/dist/**
+
+# IDE/editor
+.idea/
+*.iml
+.vscode/
+
+# Local environment files
+.env
+.env.*
+
+# Optional local cache directories
+.cache/
