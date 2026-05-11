@@ -249,7 +249,7 @@ func TestWorkflowWorkerExecutesDependentSteps(t *testing.T) {
 	defer cancel()
 	go func() { _ = worker.Run(workerCtx) }()
 
-	run, err := module.Start(ctx, "dependent", map[string]any{"name": "alexis"}, nil)
+	run, err := module.Start(ctx, "dependent", map[string]any{"name": "rowan"}, nil)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
