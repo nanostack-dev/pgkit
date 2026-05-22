@@ -21,6 +21,9 @@ dist/
 build/
 tmp/
 
+# JavaScript dependencies
+node_modules/
+
 # Root-level local binaries
 /pgkit-example
 /pgkit-playground
@@ -31,6 +34,7 @@ tmp/
 
 # IDE/editor
 .idea/
+.run/
 *.iml
 .vscode/
 
