@@ -27,61 +27,59 @@ This document is meant for humans maintaining the package. It explains the menta
 
 ## Lifecycle Overview
 
-```plantuml
-@startuml
-title Workflow lifecycle
+```mermaid
+sequenceDiagram
+    title Workflow lifecycle
 
-actor Application
-participant "workflow.Module" as Module
-database PostgreSQL as DB
-participant "queue.Worker" as Worker
+    actor Application
+    participant Module as workflow.Module
+    participant DB as PostgreSQL
+    participant Worker as queue.Worker
 
-Application -> Module: Register(definition)
-Application -> Module: Publish(name)
-Module -> DB: insert/select workflow_definitions
+    Application->>Module: Register(definition)
+    Application->>Module: Publish(name)
+    Module->>DB: insert/select workflow_definitions
 
-Application -> Module: Activate(name, version)
-Module -> DB: update workflow_definitions
-Module -> DB: upsert workflow_definition_aliases
+    Application->>Module: Activate(name, version)
+    Module->>DB: update workflow_definitions
+    Module->>DB: upsert workflow_definition_aliases
 
-Application -> Module: Start(name, input)
-Module -> DB: insert workflow_runs
-Module -> DB: insert workflow_steps
-Module -> DB: enqueue root step jobs via queue tables
+    Application->>Module: Start(name, input)
+    Module->>DB: insert workflow_runs
+    Module->>DB: insert workflow_steps
+    Module->>DB: enqueue root step jobs via queue tables
 
-Worker -> DB: claim internal queue job
-Worker -> Module: executeJob(payload, claimed job)
-Module -> DB: lock step row + load run/definition
-Module -> Module: execute handler / tx handler / foreach resolver
-Module -> DB: persist output and update step status
-Module -> DB: materialize foreach children if needed
-Module -> DB: enqueue newly unlocked dependents
-Module -> DB: mark run succeeded or failed
-Worker -> DB: ack/retry/fail queue job
-@enduml
+    Worker->>DB: claim internal queue job
+    Worker->>Module: executeJob(payload, claimed job)
+    Module->>DB: lock step row + load run/definition
+    Module->>Module: execute handler / tx handler / foreach resolver
+    Module->>DB: persist output and update step status
+    Module->>DB: materialize foreach children if needed
+    Module->>DB: enqueue newly unlocked dependents
+    Module->>DB: mark run succeeded or failed
+    Worker->>DB: ack/retry/fail queue job
 ```
 
 ## Foreach Fan-Out Model
 
-```plantuml
-@startuml
-title Foreach step execution model
+```mermaid
+sequenceDiagram
+    title Foreach step execution model
 
-participant "Root foreach step row" as Root
-participant "Resolver" as Resolver
-database PostgreSQL as DB
-participant "Child step rows" as Children
-participant "Dependent step" as Dep
+    participant Root as Root foreach step row
+    participant Resolver
+    participant DB as PostgreSQL
+    participant Children as Child step rows
+    participant Dep as Dependent step
 
-Root -> Resolver: produce []item payloads
-Resolver --> Root: JSON array
-Root -> DB: mark root row succeeded
-Root -> DB: upsert child rows (run_id, step_name, item_key)
-Root -> DB: enqueue one queue job per child row
-Children -> DB: run item handlers and store item outputs
-Children -> DB: all child rows reach succeeded
-DB -> Dep: dependent step becomes eligible
-@enduml
+    Root->>Resolver: produce []item payloads
+    Resolver-->>Root: JSON array
+    Root->>DB: mark root row succeeded
+    Root->>DB: upsert child rows (run_id, step_name, item_key)
+    Root->>DB: enqueue one queue job per child row
+    Children->>DB: run item handlers and store item outputs
+    Children->>DB: all child rows reach succeeded
+    DB->>Dep: dependent step becomes eligible
 ```
 
 ## Important Invariants
