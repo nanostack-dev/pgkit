@@ -261,10 +261,7 @@ func normalizeRunListPage(params ListRunsParams) (int, int) {
 	if limit > 100 {
 		limit = 100
 	}
-	offset := params.Offset
-	if offset < 0 {
-		offset = 0
-	}
+	offset := max(params.Offset, 0)
 	return limit, offset
 }
 

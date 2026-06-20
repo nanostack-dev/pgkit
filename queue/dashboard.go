@@ -234,10 +234,7 @@ func (d *Dashboard) handleJobsFragment(w http.ResponseWriter, r *http.Request) {
 	hasPrev := query.Offset > 0
 	nextOffset := query.Offset + query.Limit
 	hasNext := int64(nextOffset) < total
-	prevOffset := query.Offset - query.Limit
-	if prevOffset < 0 {
-		prevOffset = 0
-	}
+	prevOffset := max(query.Offset-query.Limit, 0)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := d.tmpl.ExecuteTemplate(w, "jobs_fragment", map[string]any{

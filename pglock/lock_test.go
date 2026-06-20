@@ -35,11 +35,8 @@ func TestTryWithLockConcurrentExclusion(t *testing.T) {
 	var currentHolders atomic.Int32
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+	for range workers {
+		wg.Go(func() {
 			_, err := client.TryWithLock(ctx, "shared-lock", func(_ context.Context, _ *sql.Tx) error {
 				now := currentHolders.Add(1)
 				for {
@@ -59,7 +56,7 @@ func TestTryWithLockConcurrentExclusion(t *testing.T) {
 			if err != nil {
 				t.Errorf("TryWithLock failed: %v", err)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
