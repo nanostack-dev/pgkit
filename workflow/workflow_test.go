@@ -1094,7 +1094,7 @@ func TestWorkflowForEachHighFanout(t *testing.T) {
 	def, err := Define("foreach-high-fanout", func(b *Builder) {
 		b.ForEach("fanout", func(_ context.Context, _ StepContext) ([]any, error) {
 			items := make([]any, 0, itemCount)
-			for i := 0; i < itemCount; i++ {
+			for i := range itemCount {
 				items = append(items, map[string]any{"value": i})
 			}
 			return items, nil

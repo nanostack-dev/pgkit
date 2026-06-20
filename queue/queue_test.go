@@ -520,7 +520,7 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	}
 
 	// Call EnsureSchema multiple times
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := q.EnsureSchema(ctx); err != nil {
 			t.Fatalf("ensure schema iteration %d: %v", i, err)
 		}
