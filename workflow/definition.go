@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 )
 
@@ -106,10 +108,8 @@ func (d *Definition) validate() error {
 		if step.Kind == StepKindForEach && step.Resolver == nil {
 			return fmt.Errorf("workflow: foreach step %s has no resolver", step.Name)
 		}
-		for _, dep := range step.DependsOn {
-			if dep == "" {
-				return fmt.Errorf("workflow: step %s contains empty dependency", step.Name)
-			}
+		if slices.Contains(step.DependsOn, "") {
+			return fmt.Errorf("workflow: step %s contains empty dependency", step.Name)
 		}
 	}
 	for _, step := range d.steps {
@@ -200,10 +200,8 @@ func hasCycle(steps []StepSpec) bool {
 			return false
 		}
 		state[node] = 1
-		for _, dep := range deps[node] {
-			if visit(dep) {
-				return true
-			}
+		if slices.ContainsFunc(deps[node], visit) {
+			return true
 		}
 		state[node] = 2
 		return false
@@ -233,8 +231,6 @@ func cloneMap(in map[string]any) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }

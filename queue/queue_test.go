@@ -392,10 +392,10 @@ func TestConcurrentClaimNoDuplicates(t *testing.T) {
 	const numWorkers = 20
 
 	// Enqueue N jobs
-	for i := 0; i < numJobs; i++ {
+	for i := range numJobs {
 		_, err := q.Enqueue(ctx, EnqueueParams{
 			QueueName: "concurrent",
-			Payload:   []byte(fmt.Sprintf("job-%d", i)),
+			Payload:   fmt.Appendf(nil, "job-%d", i),
 		})
 		if err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
@@ -407,7 +407,7 @@ func TestConcurrentClaimNoDuplicates(t *testing.T) {
 	claimed := make(map[int64]string) // jobID -> worker
 	var wg sync.WaitGroup
 
-	for w := 0; w < numWorkers; w++ {
+	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
@@ -520,7 +520,7 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	}
 
 	// Call EnsureSchema multiple times
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := q.EnsureSchema(ctx); err != nil {
 			t.Fatalf("ensure schema iteration %d: %v", i, err)
 		}
