@@ -112,6 +112,68 @@ func TestTryWithSessionLockExclusive(t *testing.T) {
 	}
 }
 
+func TestTryAdvisoryXactLockNilTx(t *testing.T) {
+	_, err := TryAdvisoryXactLock(context.Background(), nil, "any")
+	if !errors.Is(err, ErrNilTx) {
+		t.Fatalf("expected ErrNilTx, got %v", err)
+	}
+}
+
+func TestTryAdvisoryXactLockBoundToCallerTx(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+
+	const key = "byo-tx-lock"
+
+	tx1, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+
+	locked1, err := TryAdvisoryXactLock(ctx, tx1, key)
+	if err != nil {
+		t.Fatalf("tx1 acquire: %v", err)
+	}
+	if !locked1 {
+		t.Fatalf("tx1 expected to acquire lock")
+	}
+
+	// tx2 runs on a different pooled connection (tx1 still holds its own), so it
+	// must not take the same key while tx1 is open.
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	locked2, err := TryAdvisoryXactLock(ctx, tx2, key)
+	if err != nil {
+		t.Fatalf("tx2 acquire: %v", err)
+	}
+	if locked2 {
+		t.Fatalf("tx2 acquired a lock held by tx1")
+	}
+	if err := tx2.Rollback(); err != nil {
+		t.Fatalf("rollback tx2: %v", err)
+	}
+
+	// Committing tx1 releases the xact lock; a fresh transaction can then take it.
+	if err := tx1.Commit(); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+
+	tx3, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx3: %v", err)
+	}
+	defer func() { _ = tx3.Rollback() }()
+	locked3, err := TryAdvisoryXactLock(ctx, tx3, key)
+	if err != nil {
+		t.Fatalf("tx3 acquire: %v", err)
+	}
+	if !locked3 {
+		t.Fatalf("tx3 expected to acquire lock after tx1 committed")
+	}
+}
+
 func TestKeyHashStability(t *testing.T) {
 	const expected int64 = -4125332225188682556
 	if got := KeyHash("integration-events-monitor"); got != expected {

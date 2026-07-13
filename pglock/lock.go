@@ -11,6 +11,8 @@ import (
 
 var ErrNilDB = errors.New("pglock: db is nil")
 
+var ErrNilTx = errors.New("pglock: tx is nil")
+
 const keyNamespace = "nanostack.dev/pgkit/pglock:"
 
 const unlockTimeout = 3 * time.Second
@@ -136,6 +138,23 @@ func (c *Client) TryWithSessionLock(
 	c.log.Debug(ctx, "session lock released", map[string]any{"key": key})
 
 	return true, nil
+}
+
+// TryAdvisoryXactLock takes a transaction-scoped advisory lock on a transaction
+// the caller already owns. It returns true when the lock is acquired and false
+// (without error) when another transaction currently holds the same key.
+//
+// Unlike TryWithLock, it neither begins nor commits a transaction: the lock is
+// bound to tx, so PostgreSQL releases it automatically when the caller commits
+// or rolls back. Use it when an outer transaction manager owns the transaction
+// (for example a request-scoped transactor) and the lock must live and die with
+// that transaction rather than a self-managed one. The caller maps a false
+// result to whatever busy/conflict signal fits its API.
+func TryAdvisoryXactLock(ctx context.Context, tx *sql.Tx, key string) (bool, error) {
+	if tx == nil {
+		return false, ErrNilTx
+	}
+	return tryAdvisoryXactLock(ctx, tx, KeyHash(key))
 }
 
 func tryAdvisoryXactLock(ctx context.Context, tx *sql.Tx, key int64) (bool, error) {
