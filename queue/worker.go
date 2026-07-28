@@ -3,10 +3,14 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +21,59 @@ var (
 	ErrHandlerAlreadySet   = errors.New("pgqueue: handler already registered for queue")
 	ErrInvalidHandler      = errors.New("pgqueue: handler is nil")
 )
+
+// connectivityErrorFragments are lowercased substrings that identify a database
+// connectivity or lifecycle failure inside a wrapped driver error whose concrete
+// type pgqueue cannot inspect — it is handed a *sql.DB and never imports a driver.
+// Each fragment is a specific network condition or PostgreSQL SQLSTATE, never a
+// generic phrase: "3d000" is invalid_catalog_name (the whole database is gone),
+// deliberately distinct from a missing *relation* (42P01), which is a real schema
+// fault that must keep logging at error.
+var connectivityErrorFragments = []string{
+	"connection reset",             // peer dropped the TCP connection
+	"connection refused",           // database not accepting connections
+	"broken pipe",                  // wrote to a closed connection
+	"no such host",                 // DNS gone: the DB service was removed
+	"i/o timeout",                  // network stalled
+	"server closed the connection", // driver-reported disconnect
+	"3d000",                        // invalid_catalog_name: database torn down
+	"57p01",                        // admin_shutdown
+	"57p03",                        // cannot_connect_now (starting up / shutting down)
+	"08006",                        // connection_failure
+	"08003",                        // connection_does_not_exist
+}
+
+// isConnectivityError reports whether err reflects the queue database being
+// unreachable, shutting down, or torn down, rather than a logic or data fault.
+// The worker's poll loop retries on the next tick, so such failures are transient
+// and non-actionable; logging them at error turns routine events — a client
+// disconnect, a graceful shutdown, or a preview database being decommissioned —
+// into false-positive alert noise. A genuine fault (bad SQL, constraint, a missing
+// relation / schema drift) does not match and stays at error.
+//
+// Detection is driver-agnostic: it matches the standard sentinels via errors.Is,
+// then falls back to specific message fragments for the wrapped driver errors
+// whose types are not visible from here.
+func isConnectivityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, frag := range connectivityErrorFragments {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
 
 // Handled marks a job as already finalized by custom runtime logic.
 // Worker skips Ack/Retry/Fail when this error is returned.
@@ -257,10 +314,24 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.runOnce(ctx)
 		case <-reapTicker.C:
 			if err := w.reap(ctx); err != nil {
-				w.client.logError(ctx, "queue reap cycle failed", map[string]any{"error": err.Error()})
+				w.logPollError(ctx, "queue reap cycle failed", map[string]any{"error": err.Error()}, err)
 			}
 		}
 	}
+}
+
+// logPollError logs a failure from the worker's periodic poll loop. A connectivity
+// or lifecycle failure (database unreachable, shutting down, or torn down) is
+// transient — the next tick retries — so it logs at warn to avoid false-positive
+// error alerts on events an operator cannot act on; every other failure stays at
+// error. Message and fields are identical either way, so dashboards and searches
+// are unaffected.
+func (w *Worker) logPollError(ctx context.Context, msg string, fields map[string]any, err error) {
+	if isConnectivityError(err) {
+		w.client.logWarn(ctx, msg, fields)
+		return
+	}
+	w.client.logError(ctx, msg, fields)
 }
 
 func (w *Worker) runOnce(ctx context.Context) {
@@ -273,7 +344,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 		for i := 0; i < w.cfg.BatchSizePerQueue; i++ {
 			job, found, err := w.client.Claim(ctx, queueName, w.cfg.WorkerID)
 			if err != nil {
-				w.client.logError(ctx, "queue claim failed", map[string]any{"queue": queueName, "error": err.Error()})
+				w.logPollError(ctx, "queue claim failed", map[string]any{"queue": queueName, "error": err.Error()}, err)
 				break
 			}
 			if !found || job == nil {
