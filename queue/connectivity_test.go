@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TestIsConnectivityError pins the classifier that decides whether a worker
@@ -32,13 +34,25 @@ func TestIsConnectivityError(t *testing.T) {
 		{"conn done", sql.ErrConnDone, true},
 		{"eof", io.EOF, true},
 
-		// Wrapped driver errors we can only see as text — the shapes observed in
-		// production preview churn.
+		// Server-sent errors carry a SQLSTATE, matched structurally on
+		// pgconn.PgError.Code — no substring guessing.
 		{
 			"preview database torn down (3D000)",
-			errors.New(`pgqueue: begin claim tx: pq: database "pr_update_go_deps_nanostack" does not exist (3D000)`),
+			&pgconn.PgError{Code: "3D000", Message: `database "pr_update_go_deps_nanostack" does not exist`},
 			true,
 		},
+		{"admin shutdown (57P01)", &pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"}, true},
+		{"cannot connect now (57P03)", &pgconn.PgError{Code: "57P03", Message: "the database system is shutting down"}, true},
+		{"connection failure (08006)", &pgconn.PgError{Code: "08006"}, true},
+		{"connection does not exist (08003)", &pgconn.PgError{Code: "08003"}, true},
+		{
+			"wrapped pg error is still found through errors.As",
+			fmt.Errorf("pgqueue: begin claim tx: %w", &pgconn.PgError{Code: "3D000", Message: `database "preview_42" does not exist`}),
+			true,
+		},
+
+		// Network and driver failures that carry no SQLSTATE, and the fallback for
+		// callers that wired up a non-pgx driver. Text is all there is.
 		{
 			"connection reset by peer",
 			errors.New("pgqueue: begin claim tx: read tcp 172.18.0.15:40200->192.168.2.61:5432: read: connection reset by peer"),
@@ -46,7 +60,6 @@ func TestIsConnectivityError(t *testing.T) {
 		},
 		{"connection refused", errors.New("pgqueue: begin claim tx: dial tcp: connection refused"), true},
 		{"broken pipe", errors.New("pgqueue: commit claim tx: write: broken pipe"), true},
-		{"admin shutdown 57P01", errors.New("pq: terminating connection due to administrator command (57P01)"), true},
 
 		// Critical negatives: real faults must keep logging at error.
 		{
@@ -54,8 +67,20 @@ func TestIsConnectivityError(t *testing.T) {
 			errors.New(`pgqueue: claim: pq: relation "pgqueue_jobs" does not exist (42P01)`),
 			false,
 		},
+		{
+			"missing relation as a pg error is still schema drift (42P01)",
+			&pgconn.PgError{Code: "42P01", Message: `relation "pgqueue_jobs" does not exist`},
+			false,
+		},
 		{"sql syntax fault", errors.New(`pq: syntax error at or near "SELCT" (42601)`), false},
+		{"sql syntax fault as a pg error", &pgconn.PgError{Code: "42601", Message: `syntax error at or near "SELCT"`}, false},
 		{"plain business error", errors.New("pgqueue: job not found or not in expected state"), false},
+
+		// A SQLSTATE reachable only as message text — a non-pgx driver formatting a
+		// server error — is no longer downgraded. That is the deliberate trade of
+		// matching codes structurally: pgx callers are covered by the branch above,
+		// and the fragment list keeps no raw codes to collide with unrelated text.
+		{"bare sqlstate in text is not matched", errors.New("pq: terminating connection due to administrator command (57P01)"), false},
 	}
 
 	for _, tc := range cases {

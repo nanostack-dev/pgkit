@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -22,13 +25,40 @@ var (
 	ErrInvalidHandler      = errors.New("pgqueue: handler is nil")
 )
 
-// connectivityErrorFragments are lowercased substrings that identify a database
-// connectivity or lifecycle failure inside a wrapped driver error whose concrete
-// type pgqueue cannot inspect — it is handed a *sql.DB and never imports a driver.
-// Each fragment is a specific network condition or PostgreSQL SQLSTATE, never a
-// generic phrase: "3d000" is invalid_catalog_name (the whole database is gone),
-// deliberately distinct from a missing *relation* (42P01), which is a real schema
-// fault that must keep logging at error.
+// PostgreSQL SQLSTATE codes that mark the queue database as unreachable, shutting
+// down, or torn down. Named after the condition names in the PostgreSQL error-code
+// appendix. Postgres reports SQLSTATEs uppercase on the wire, so these are matched
+// verbatim against pgconn.PgError.Code.
+//
+// The set is deliberately narrow. Note in particular that undefined_table (42P01)
+// is absent: a missing *relation* is schema drift, a real fault that must keep
+// logging at error, whereas invalid_catalog_name (3D000) means the whole database
+// is gone — a torn-down preview environment, not a bug.
+const (
+	sqlStateInvalidCatalogName     = "3D000" // database does not exist (torn down)
+	sqlStateConnectionDoesNotExist = "08003"
+	sqlStateConnectionFailure      = "08006"
+	sqlStateAdminShutdown          = "57P01" // terminated by administrator command
+	sqlStateCannotConnectNow       = "57P03" // server starting up or shutting down
+)
+
+var connectivitySQLStates = []string{
+	sqlStateInvalidCatalogName,
+	sqlStateConnectionDoesNotExist,
+	sqlStateConnectionFailure,
+	sqlStateAdminShutdown,
+	sqlStateCannotConnectNow,
+}
+
+// connectivityErrorFragments are lowercased substrings that identify a network or
+// driver-level connectivity failure that carries no SQLSTATE at all: the peer
+// dropped the socket, DNS vanished, the dial never completed. Postgres never
+// assigns these a code, so there is nothing structural to match on.
+//
+// They double as the fallback for non-pgx drivers. pgqueue is handed a *sql.DB and
+// does not choose the driver, so when the caller wires up lib/pq rather than pgx
+// the errors.As check below cannot match and only the message text remains. Every
+// fragment names a specific condition, never a generic phrase.
 var connectivityErrorFragments = []string{
 	"connection reset",             // peer dropped the TCP connection
 	"connection refused",           // database not accepting connections
@@ -36,11 +66,6 @@ var connectivityErrorFragments = []string{
 	"no such host",                 // DNS gone: the DB service was removed
 	"i/o timeout",                  // network stalled
 	"server closed the connection", // driver-reported disconnect
-	"3d000",                        // invalid_catalog_name: database torn down
-	"57p01",                        // admin_shutdown
-	"57p03",                        // cannot_connect_now (starting up / shutting down)
-	"08006",                        // connection_failure
-	"08003",                        // connection_does_not_exist
 }
 
 // isConnectivityError reports whether err reflects the queue database being
@@ -51,9 +76,11 @@ var connectivityErrorFragments = []string{
 // into false-positive alert noise. A genuine fault (bad SQL, constraint, a missing
 // relation / schema drift) does not match and stays at error.
 //
-// Detection is driver-agnostic: it matches the standard sentinels via errors.Is,
-// then falls back to specific message fragments for the wrapped driver errors
-// whose types are not visible from here.
+// Detection is structural wherever the error carries structure: the standard
+// sentinels via errors.Is, then a *pgconn.PgError's SQLSTATE via errors.As, which
+// finds the code however deeply the error is wrapped. Substring matching is the
+// last resort, reserved for failures that have no SQLSTATE behind them and for
+// drivers other than pgx.
 func isConnectivityError(err error) bool {
 	if err == nil {
 		return false
@@ -65,6 +92,9 @@ func isConnectivityError(err error) bool {
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, io.EOF) {
 		return true
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+		return slices.Contains(connectivitySQLStates, pgErr.Code)
 	}
 	msg := strings.ToLower(err.Error())
 	for _, frag := range connectivityErrorFragments {
