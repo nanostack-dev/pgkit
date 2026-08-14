@@ -10,6 +10,7 @@ Go PostgreSQL primitives: `pglock` (advisory locks), `pgqueue` (durable queue), 
 - Never surface internal DB errors, secrets, or auth tokens through the dashboard/API.
 - Mutating dashboard/API endpoints stay disable-able in production and are protected by constant-time token auth plus CSRF mitigation.
 - App-specific workflow naming belongs in the calling app, not here.
+- Avoid comments — name variables and functions clearly instead. Comment only a genuinely complex algorithm.
 
 ## Verification
 
