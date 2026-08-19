@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -28,7 +26,7 @@ var (
 // PostgreSQL SQLSTATE codes that mark the queue database as unreachable, shutting
 // down, or torn down. Named after the condition names in the PostgreSQL error-code
 // appendix. Postgres reports SQLSTATEs uppercase on the wire, so these are matched
-// verbatim against pgconn.PgError.Code.
+// verbatim against the driver error's SQLState().
 //
 // The set is deliberately narrow. Note in particular that undefined_table (42P01)
 // is absent: a missing *relation* is schema drift, a real fault that must keep
@@ -68,6 +66,15 @@ var connectivityErrorFragments = []string{
 	"server closed the connection", // driver-reported disconnect
 }
 
+// sqlStater is the SQLSTATE accessor that Postgres driver errors expose — pgx's
+// *pgconn.PgError and lib/pq's *pq.Error both implement it. Matching this instead
+// of a concrete driver type lets isConnectivityError read the code structurally
+// whatever driver the caller wired into its *sql.DB, with no import on either.
+type sqlStater interface {
+	error
+	SQLState() string
+}
+
 // isConnectivityError reports whether err reflects the queue database being
 // unreachable, shutting down, or torn down, rather than a logic or data fault.
 // The worker's poll loop retries on the next tick, so such failures are transient
@@ -77,10 +84,12 @@ var connectivityErrorFragments = []string{
 // relation / schema drift) does not match and stays at error.
 //
 // Detection is structural wherever the error carries structure: the standard
-// sentinels via errors.Is, then a *pgconn.PgError's SQLSTATE via errors.As, which
-// finds the code however deeply the error is wrapped. Substring matching is the
-// last resort, reserved for failures that have no SQLSTATE behind them and for
-// drivers other than pgx.
+// sentinels via errors.Is, then the driver error's SQLSTATE via errors.As, which
+// finds the code however deeply the error is wrapped. Both mainstream Postgres
+// drivers expose it the same way — pgx's *pgconn.PgError and lib/pq's *pq.Error
+// each satisfy sqlStater — so the match is driver-agnostic and pgqueue stays
+// decoupled from whichever driver the caller wired into its *sql.DB. Substring
+// matching is the last resort, reserved for failures that carry no SQLSTATE at all.
 func isConnectivityError(err error) bool {
 	if err == nil {
 		return false
@@ -93,8 +102,8 @@ func isConnectivityError(err error) bool {
 		errors.Is(err, io.EOF) {
 		return true
 	}
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
-		return slices.Contains(connectivitySQLStates, pgErr.Code)
+	if pgErr, ok := errors.AsType[sqlStater](err); ok {
+		return slices.Contains(connectivitySQLStates, pgErr.SQLState())
 	}
 	msg := strings.ToLower(err.Error())
 	for _, frag := range connectivityErrorFragments {

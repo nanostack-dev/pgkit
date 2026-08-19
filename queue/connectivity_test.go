@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lib/pq"
 )
 
 // TestIsConnectivityError pins the classifier that decides whether a worker
@@ -51,6 +52,26 @@ func TestIsConnectivityError(t *testing.T) {
 			true,
 		},
 
+		// lib/pq is the other mainstream driver (anchor wires it up). Its *pq.Error
+		// exposes the SQLSTATE structurally via SQLState() just like pgx, so a
+		// torn-down preview database is downgraded regardless of driver, and a
+		// wrapped one is still found through errors.As.
+		{
+			"lib/pq preview database torn down (3D000)",
+			&pq.Error{Code: "3D000", Message: `database "pr_organization_create_with_licen_nanostack" does not exist`},
+			true,
+		},
+		{
+			"wrapped lib/pq pg error is still found through errors.As",
+			fmt.Errorf("pgqueue: begin claim tx: %w", &pq.Error{Code: "57P01", Message: "terminating connection due to administrator command"}),
+			true,
+		},
+		{
+			"lib/pq missing relation is schema drift, not connectivity (42P01)",
+			&pq.Error{Code: "42P01", Message: `relation "pgqueue_jobs" does not exist`},
+			false,
+		},
+
 		// Network and driver failures that carry no SQLSTATE, and the fallback for
 		// callers that wired up a non-pgx driver. Text is all there is.
 		{
@@ -76,10 +97,11 @@ func TestIsConnectivityError(t *testing.T) {
 		{"sql syntax fault as a pg error", &pgconn.PgError{Code: "42601", Message: `syntax error at or near "SELCT"`}, false},
 		{"plain business error", errors.New("pgqueue: job not found or not in expected state"), false},
 
-		// A SQLSTATE reachable only as message text — a non-pgx driver formatting a
-		// server error — is no longer downgraded. That is the deliberate trade of
-		// matching codes structurally: pgx callers are covered by the branch above,
-		// and the fragment list keeps no raw codes to collide with unrelated text.
+		// A SQLSTATE reachable only as message text — a bare string with no driver
+		// error type behind it — is not downgraded. That is the deliberate trade of
+		// matching codes structurally: real driver errors (pgx, lib/pq) expose
+		// SQLState() and are covered by the branch above, while the fragment list
+		// keeps no raw codes to collide with unrelated text.
 		{"bare sqlstate in text is not matched", errors.New("pq: terminating connection due to administrator command (57P01)"), false},
 	}
 
