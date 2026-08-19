@@ -109,6 +109,94 @@ type ReapResult struct {
 }
 
 // ---------------------------------------------------------------------------
+// Job row mapping
+// ---------------------------------------------------------------------------
+
+// scanner is satisfied by both *sql.Row and *sql.Rows.
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+// jobColumns are the pgqueue_jobs columns every job query reads, in the order
+// scanJob assigns them. Adding a column means editing this list and scanJob, and
+// nothing else — the select, returning, and scan sites all derive from here.
+var jobColumns = []string{
+	"id", "queue_name", "payload", "status", "attempts", "max_attempts", "available_at",
+	"claimed_by", "claimed_at", "done_at", "last_error", "created_at", "updated_at",
+}
+
+var (
+	jobSelectColumns = strings.Join(jobColumns, ", ")
+	// Claim joins the jobs table against a CTE that also has an id column, so its
+	// RETURNING list must name the table alias to stay unambiguous.
+	jobReturningColumns = qualifyColumns("j", jobColumns)
+)
+
+func qualifyColumns(alias string, columns []string) string {
+	qualified := make([]string, len(columns))
+	for i, column := range columns {
+		qualified[i] = alias + "." + column
+	}
+	return strings.Join(qualified, ", ")
+}
+
+func scanJob(row scanner) (Job, error) {
+	var job Job
+	if err := row.Scan(
+		&job.ID,
+		&job.QueueName,
+		&job.Payload,
+		&job.Status,
+		&job.Attempts,
+		&job.MaxAttempts,
+		&job.AvailableAt,
+		&job.ClaimedBy,
+		&job.ClaimedAt,
+		&job.DoneAt,
+		&job.LastError,
+		&job.CreatedAt,
+		&job.UpdatedAt,
+	); err != nil {
+		return Job{}, err
+	}
+	return job, nil
+}
+
+// buildJobFilterClause renders the WHERE clause shared by ListJobs and CountJobs,
+// returning an empty clause when no filter is set. Keeping both on one builder is
+// what makes a count agree with the page it counts.
+func buildJobFilterClause(p ListJobsParams) (string, []any) {
+	clauses := make([]string, 0, 3)
+	args := make([]any, 0, 3)
+	argIndex := 1
+
+	if p.QueueName != "" {
+		clauses = append(clauses, fmt.Sprintf("queue_name = $%d", argIndex))
+		args = append(args, p.QueueName)
+		argIndex++
+	}
+	if p.Status != "" {
+		clauses = append(clauses, fmt.Sprintf("status = $%d", argIndex))
+		args = append(args, string(p.Status))
+		argIndex++
+	}
+	if search := strings.TrimSpace(p.Search); search != "" {
+		// Security: the search term is bound as a parameter. Never interpolate user
+		// input into SQL text.
+		clauses = append(clauses, fmt.Sprintf(
+			"(queue_name ILIKE $%d OR encode(payload, 'escape') ILIKE $%d OR COALESCE(last_error, '') ILIKE $%d)",
+			argIndex, argIndex, argIndex,
+		))
+		args = append(args, "%"+search+"%")
+	}
+
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// ---------------------------------------------------------------------------
 // Hooks / Metrics interface (P2 #12)
 // ---------------------------------------------------------------------------
 
@@ -410,7 +498,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	row := tx.QueryRowContext(ctx,
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(
 		`WITH next_job AS (
 			SELECT id
 			FROM pgqueue_jobs
@@ -430,17 +518,11 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 		     updated_at = NOW()
 		 FROM next_job
 		 WHERE j.id = next_job.id
-		 RETURNING j.id, j.queue_name, j.payload, j.status, j.attempts, j.max_attempts, j.available_at,
-		           j.claimed_by, j.claimed_at, j.done_at, j.last_error, j.created_at, j.updated_at`,
+		 RETURNING %s`, jobReturningColumns),
 		queueName, worker,
 	)
 
-	j := &Job{}
-	scanErr := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
-		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-		&j.CreatedAt, &j.UpdatedAt,
-	)
+	j, scanErr := scanJob(row)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		if commitErr := tx.Commit(); commitErr != nil {
 			return nil, false, fmt.Errorf("pgqueue: commit empty claim tx: %w", commitErr)
@@ -456,7 +538,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 	}
 
 	c.emit(ctx, EventClaim, map[string]any{"id": j.ID, "queue": queueName, "worker": worker})
-	return j, true, nil
+	return &j, true, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -694,41 +776,14 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 		return nil, ErrSearchTooLong
 	}
 
-	// Build query dynamically based on optional filters.
-	query := `SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
-	                 claimed_by, claimed_at, done_at, last_error, created_at, updated_at
-	          FROM pgqueue_jobs WHERE 1=1`
-	args := make([]any, 0, 4)
-	argIdx := 1
-
-	if p.QueueName != "" {
-		query += fmt.Sprintf(" AND queue_name = $%d", argIdx)
-		args = append(args, p.QueueName)
-		argIdx++
-	}
-	if p.Status != "" {
-		query += fmt.Sprintf(" AND status = $%d", argIdx)
-		args = append(args, string(p.Status))
-		argIdx++
-	}
-	if p.Search != "" {
-		// Security: search term is bound as a parameter. Never interpolate user input into SQL text.
-		query += fmt.Sprintf(
-			" AND (queue_name ILIKE $%d OR encode(payload, 'escape') ILIKE $%d OR COALESCE(last_error, '') ILIKE $%d)",
-			argIdx, argIdx, argIdx,
-		)
-		args = append(args, "%"+p.Search+"%")
-		argIdx++
-	}
-
-	query += " ORDER BY id DESC"
-
-	query += fmt.Sprintf(" LIMIT $%d", argIdx)
+	whereClause, args := buildJobFilterClause(p)
+	query := fmt.Sprintf(`SELECT %s
+	          FROM pgqueue_jobs%s
+	          ORDER BY id DESC LIMIT $%d`, jobSelectColumns, whereClause, len(args)+1)
 	args = append(args, p.Limit)
-	argIdx++
 
 	if p.Offset > 0 {
-		query += fmt.Sprintf(" OFFSET $%d", argIdx)
+		query += fmt.Sprintf(" OFFSET $%d", len(args)+1)
 		args = append(args, p.Offset)
 	}
 
@@ -740,12 +795,8 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 
 	jobs := make([]Job, 0, p.Limit)
 	for rows.Next() {
-		var j Job
-		if err := rows.Scan(
-			&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
-			&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-			&j.CreatedAt, &j.UpdatedAt,
-		); err != nil {
+		j, err := scanJob(rows)
+		if err != nil {
 			return nil, fmt.Errorf("pgqueue: scan list jobs: %w", err)
 		}
 		jobs = append(jobs, j)
@@ -770,27 +821,8 @@ func (c *Client) CountJobs(ctx context.Context, p ListJobsParams) (int64, error)
 		return 0, ErrSearchTooLong
 	}
 
-	query := `SELECT COUNT(*) FROM pgqueue_jobs WHERE 1=1`
-	args := make([]any, 0, 4)
-	argIdx := 1
-
-	if p.QueueName != "" {
-		query += fmt.Sprintf(" AND queue_name = $%d", argIdx)
-		args = append(args, p.QueueName)
-		argIdx++
-	}
-	if p.Status != "" {
-		query += fmt.Sprintf(" AND status = $%d", argIdx)
-		args = append(args, string(p.Status))
-		argIdx++
-	}
-	if p.Search != "" {
-		query += fmt.Sprintf(
-			" AND (queue_name ILIKE $%d OR encode(payload, 'escape') ILIKE $%d OR COALESCE(last_error, '') ILIKE $%d)",
-			argIdx, argIdx, argIdx,
-		)
-		args = append(args, "%"+p.Search+"%")
-	}
+	whereClause, args := buildJobFilterClause(p)
+	query := `SELECT COUNT(*) FROM pgqueue_jobs` + whereClause
 
 	var total int64
 	if err := c.db.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
@@ -805,19 +837,14 @@ func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
 		return nil, ErrNilDB
 	}
 
-	row := c.db.QueryRowContext(ctx,
-		`SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
-                claimed_by, claimed_at, done_at, last_error, created_at, updated_at
-         FROM pgqueue_jobs WHERE id = $1`,
+	row := c.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT %s
+         FROM pgqueue_jobs WHERE id = $1`, jobSelectColumns),
 		id,
 	)
 
-	var j Job
-	if err := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
-		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-		&j.CreatedAt, &j.UpdatedAt,
-	); err != nil {
+	j, err := scanJob(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrJobNotFound
 		}
