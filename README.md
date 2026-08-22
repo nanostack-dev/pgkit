@@ -15,6 +15,7 @@ go get github.com/nanostack-dev/pgkit
 - `workflow`: durable temporal-style workflows built on top of `queue` ([docs](workflow/README.md))
 - `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
 - `fx`: plug-and-play Uber Fx modules for all packages
+- `zerologqueue`: `queue.WorkerConfig`'s `OnJobFailed`/`OnJobStuck` callbacks, built from a `zerolog.Logger`
 
 ## Worker runtime
 
@@ -25,6 +26,24 @@ go get github.com/nanostack-dev/pgkit
 - typed JSON listener only: `RegisterJSON[T](...)`
 
 Worker handles claim loop, ack/retry/fail, and stuck-job reaping.
+
+`OnJobFailed`/`OnJobStuck` are plain `func` fields, so `queue` itself takes no
+opinion on how they log. If you use zerolog, `zerologqueue.WorkerCallbacks`
+builds the pair:
+
+```go
+onJobFailed, onJobStuck := zerologqueue.WorkerCallbacks(logger, "my worker", nil)
+worker, err := queue.NewWorker(client, registry, queue.WorkerConfig{
+    // ...
+    OnJobFailed: onJobFailed,
+    OnJobStuck:  onJobStuck,
+})
+```
+
+Pass a `severity func(queue.ReapResult) zerolog.Level` as the third argument
+to control what level a reap logs at — `zerologqueue.EscalateOnFailure` logs
+at error when the reap dead-lettered a job, and at warn otherwise. `nil`
+always logs a reap at warn.
 
 ## Admin UI Dashboard
 
