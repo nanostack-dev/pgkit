@@ -30,7 +30,7 @@ func (m *Module) GetRunGraphView(ctx context.Context, runID string) (*RunGraphVi
 	if err != nil {
 		return nil, err
 	}
-	defRecord, err := getDefinitionByVersionDB(ctx, m.db, run.WorkflowName, run.WorkflowVersion)
+	defRecord, err := getDefinitionByVersion(ctx, m.db, run.WorkflowName, run.WorkflowVersion)
 	if err != nil {
 		return nil, err
 	}
