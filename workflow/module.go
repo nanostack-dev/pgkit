@@ -427,7 +427,7 @@ FROM workflow_definitions`, definitionSelectColumns)
 }
 
 func (m *Module) GetDefinitionVersion(ctx context.Context, workflowName string, version int) (*DefinitionRecord, error) {
-	return getDefinitionByVersionDB(ctx, m.db, workflowName, version)
+	return getDefinitionByVersion(ctx, m.db, workflowName, version)
 }
 
 func (m *Module) ListRuns(ctx context.Context, params ListRunsParams) ([]RunRecord, error) {

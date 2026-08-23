@@ -126,22 +126,7 @@ func nextDefinitionVersion(ctx context.Context, tx *sql.Tx, workflowName string)
 	return next, nil
 }
 
-func getDefinitionByVersion(ctx context.Context, tx *sql.Tx, workflowName string, version int) (*DefinitionRecord, error) {
-	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
-SELECT %s
-FROM workflow_definitions
-WHERE workflow_name = $1 AND version = $2`, definitionSelectColumns), workflowName, version)
-	record, err := scanDefinition(row)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("%w: %s@v%d", ErrDefinitionNotFound, workflowName, version)
-		}
-		return nil, fmt.Errorf("workflow: get definition by version: %w", err)
-	}
-	return &record, nil
-}
-
-func getDefinitionByVersionDB(ctx context.Context, db *sql.DB, workflowName string, version int) (*DefinitionRecord, error) {
+func getDefinitionByVersion(ctx context.Context, db queryer, workflowName string, version int) (*DefinitionRecord, error) {
 	row := db.QueryRowContext(ctx, fmt.Sprintf(`
 SELECT %s
 FROM workflow_definitions
