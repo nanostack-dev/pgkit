@@ -44,3 +44,6 @@ node_modules/
 
 # Optional local cache directories
 .cache/
+
+# Agent worktrees, created by git worktree add
+worktrees/
