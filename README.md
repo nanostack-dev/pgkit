@@ -11,10 +11,11 @@ go get github.com/nanostack-dev/pgkit
 ## Packages
 
 - `pglock`: advisory lock helpers (`transaction` and `session` scoped)
+- `pgcron`: durable interval schedules shared across replicas ([docs](pgcron/README.md))
 - `queue`: durable queue with claim/ack/retry/fail/reap
 - `workflow`: durable temporal-style workflows built on top of `queue` ([docs](workflow/README.md))
 - `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
-- `fx`: plug-and-play Uber Fx modules for all packages
+- `fx`: Uber Fx modules for locks, queues, workflows, and the dashboard
 
 ## Worker runtime
 
