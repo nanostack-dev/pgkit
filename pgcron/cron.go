@@ -119,12 +119,16 @@ func (j *Job) runLocked(ctx context.Context) (Result, error) {
 	if !acquired {
 		return Result{Outcome: Busy}, nil
 	}
+	// A new job is due immediately (the column defaults to now()). Preserve an
+	// existing job's due time across restarts and calls from other replicas.
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO pgcron_schedules (name) VALUES ($1) ON CONFLICT DO NOTHING", j.params.Name); err != nil {
 		return Result{}, fmt.Errorf("initialize schedule: %w", err)
 	}
 
 	var nextRun, databaseNow time.Time
+	// Read the due time and database time together: eligibility and the wait
+	// duration must not depend on differences between replicas' local clocks.
 	if err := tx.QueryRowContext(ctx,
 		"SELECT next_run_at, now() FROM pgcron_schedules WHERE name = $1", j.params.Name).
 		Scan(&nextRun, &databaseNow); err != nil {
@@ -140,8 +144,11 @@ func (j *Job) runLocked(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("run: %w", err)
 	}
 
-	// Keep the original cadence, but coalesce missed runs. Use completion-time
-	// DB time rather than now(), which is frozen at transaction start.
+	// Move to the first scheduled tick after the callback finishes, skipping any
+	// missed ticks without shifting the cadence. For example, a 10-second job
+	// due at :00 that finishes at :25 is next due at :30, not :35.
+	// date_bin finds the last tick; adding one interval finds the next one.
+	// Use clock_timestamp(): now() is frozen at transaction start.
 	const advance = `
 UPDATE pgcron_schedules
 SET next_run_at = date_bin(make_interval(secs => $2), clock_timestamp(), next_run_at)
