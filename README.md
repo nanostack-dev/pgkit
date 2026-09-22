@@ -2,6 +2,8 @@
 
 PostgreSQL primitives for distributed systems in Go.
 
+Requires Go 1.27 or newer (typed queue handles use generic methods).
+
 Install:
 
 ```bash
@@ -26,6 +28,33 @@ go get github.com/nanostack-dev/pgkit
 - typed JSON listener only: `RegisterJSON[T](...)`
 
 Worker handles claim loop, ack/retry/fail, and stuck-job reaping.
+
+Bind a queue name and JSON payload type once for both producers and workers:
+
+```go
+type Email struct {
+    To string `json:"to"`
+}
+
+emails := client.Queue[Email]("emails").WithOptions(queue.EnqueueOptions{
+    MaxAttempts: 5,
+})
+err := emails.Register(registry, func(ctx context.Context, payload Email, job queue.Job) error {
+    return sendEmail(ctx, payload.To)
+})
+// Check err before starting the worker.
+id, err := emails.Enqueue(ctx, Email{To: "recipient@example.com"})
+// Or enqueue atomically with other writes: emails.EnqueueTx(ctx, tx, payload).
+```
+
+`WithOptions` returns a copy, so per-call overrides do not mutate a shared
+handle. `AvailableAt` defaults to database time; `MaxAttempts` defaults to 5.
+The handle validates the queue name on enqueue/registration, and reports JSON
+encoding errors before writing. Malformed stored JSON fails without retry;
+handlers remain responsible for business-field validation. Payload types are
+not registered in PostgreSQL: all callers using a queue name must agree on a
+compatible JSON shape, including old producers during rolling deployments.
+Raw enqueue and `RegisterJSON`/`RegisterJSONTyped` remain supported.
 
 ## Admin UI Dashboard
 

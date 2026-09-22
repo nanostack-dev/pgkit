@@ -1,6 +1,8 @@
 module github.com/nanostack-dev/pgkit
 
-go 1.26.5
+go 1.27
+
+toolchain go1.27.0
 
 require (
 	github.com/google/uuid v1.6.0
