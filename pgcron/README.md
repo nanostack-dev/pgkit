@@ -9,17 +9,14 @@ The runtime never creates or alters tables. All replicas must use the same
 database, search path, job name, and interval.
 
 ```go
-job, err := pgcron.New(db, pgcron.Params{
-    Name:     "myapp.refresh_search",
-    Interval: time.Minute,
-    Run: func(ctx context.Context, tx *sql.Tx) error {
-        _, err := jobs.EnqueueTx(ctx, tx, queue.EnqueueParams{
-            QueueName: "refresh_search",
-            Payload:   []byte("{}"),
-        })
+refreshJobs := jobs.Queue[struct{}]("refresh_search")
+job, err := pgcron.Named(db, "myapp.refresh_search").
+    Every(time.Minute).
+    RetryEvery(time.Second).
+    DoTx(func(ctx context.Context, tx *sql.Tx) error {
+        _, err := refreshJobs.EnqueueTx(ctx, tx, struct{}{})
         return err
-    },
-})
+    })
 if err != nil {
     return err
 }
@@ -31,6 +28,10 @@ return job.Run(ctx, func(result pgcron.Result, err error) {
 ```
 
 Use `RunOnce(ctx)` to drive a pass directly in a test or an existing loop.
+The builder is immutable configuration: `DoTx` validates and builds, but does
+not start the job or access the database. `AfterRun(hook)` optionally sets the
+post-commit hook described below. `New(db, Params{...})` remains supported with
+the same validation and scheduling behavior.
 `Run` blocks until cancellation, reports each pass, and sleeps until the
 database's due time. Local wall-clock skew does not decide eligibility.
 The caller owns the goroutine and must cancel and join it on shutdown.

@@ -32,19 +32,47 @@ func TestValidation(t *testing.T) {
 	}
 	_, err := pgcron.New(nil, pgcron.Params{Name: "nil_db", Interval: time.Minute, Run: run})
 	require.Error(t, err)
+
+	for _, builder := range []pgcron.Builder{
+		pgcron.Named(nil, "nil_db").Every(time.Minute),
+		pgcron.Named(db, " ").Every(time.Minute),
+		pgcron.Named(db, "zero_interval"),
+		pgcron.Named(db, "tiny_interval").Every(time.Microsecond),
+		pgcron.Named(db, "negative_retry").Every(time.Minute).RetryEvery(-1),
+		{},
+	} {
+		_, err := builder.DoTx(run)
+		require.Error(t, err)
+	}
+	_, err = pgcron.Named(db, "nil_callback").Every(time.Minute).DoTx(nil)
+	require.Error(t, err)
 }
 
 func TestPostgresScheduling(t *testing.T) {
 	db := testDB(t)
 	newJob := func(t *testing.T, run func(context.Context, *sql.Tx) error, after func(context.Context) error) *pgcron.Job {
 		t.Helper()
-		job, err := pgcron.New(db, pgcron.Params{
-			Name: t.Name(), Interval: time.Hour, Run: run, AfterRun: after,
-		})
+		job, err := pgcron.Named(db, t.Name()).Every(time.Hour).AfterRun(after).DoTx(run)
 		require.NoError(t, err)
 		return job
 	}
 	succeed := func(context.Context, *sql.Tx) error { return nil }
+
+	t.Run("builder copies do not change previously built jobs", func(t *testing.T) {
+		base := pgcron.Named(db, t.Name()).Every(time.Hour)
+		original, err := base.DoTx(succeed)
+		require.NoError(t, err)
+		_, err = base.Every(0).DoTx(succeed)
+		require.Error(t, err)
+		result, err := original.RunOnce(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, pgcron.Ran, result.Outcome)
+		peer, err := base.DoTx(succeed)
+		require.NoError(t, err)
+		result, err = peer.RunOnce(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, pgcron.NotDue, result.Outcome)
+	})
 
 	t.Run("staggered replicas and restart preserve schedule", func(t *testing.T) {
 		calls := 0
@@ -276,16 +304,14 @@ func TestPostgresScheduling(t *testing.T) {
 		defer cancel()
 		cause := errors.New("temporary failure")
 		calls, reports := 0, 0
-		job, err := pgcron.New(db, pgcron.Params{
-			Name: t.Name(), Interval: time.Hour, RetryInterval: time.Millisecond,
-			Run: func(context.Context, *sql.Tx) error {
+		job, err := pgcron.Named(db, t.Name()).Every(time.Hour).RetryEvery(time.Millisecond).
+			DoTx(func(context.Context, *sql.Tx) error {
 				calls++
 				if calls == 1 {
 					return cause
 				}
 				return nil
-			},
-		})
+			})
 		require.NoError(t, err)
 		require.Error(t, job.Run(ctx, nil))
 		err = job.Run(ctx, func(result pgcron.Result, err error) {
