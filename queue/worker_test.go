@@ -203,6 +203,37 @@ func TestWorkerDecodeErrorNonRetryable(t *testing.T) {
 	})
 }
 
+func TestNotifyFailedMarksJobAndInvokesCallback(t *testing.T) {
+	var callbackJob Job
+	w := &Worker{cfg: WorkerConfig{
+		OnJobFailed: func(_ context.Context, job Job) { callbackJob = job },
+	}}
+
+	job := &Job{ID: 7, Status: StatusProcessing}
+	w.notifyFailed(context.Background(), job, errors.New("boom"))
+
+	if job.Status != StatusFailed {
+		t.Errorf("job.Status = %v, want %v", job.Status, StatusFailed)
+	}
+	if !job.LastError.Valid || job.LastError.String != "boom" {
+		t.Errorf("job.LastError = %+v, want valid %q", job.LastError, "boom")
+	}
+	if callbackJob.ID != job.ID || callbackJob.Status != StatusFailed {
+		t.Errorf("callback saw %+v, want the mutated job", callbackJob)
+	}
+}
+
+func TestNotifyFailedIsNoopWithoutCallback(t *testing.T) {
+	w := &Worker{}
+	job := &Job{ID: 1, Status: StatusProcessing}
+
+	w.notifyFailed(context.Background(), job, errors.New("boom"))
+
+	if job.Status != StatusProcessing {
+		t.Errorf("job.Status = %v, want unchanged %v", job.Status, StatusProcessing)
+	}
+}
+
 func TestWorkerOnJobFailedNonRetryable(t *testing.T) {
 	ctx := context.Background()
 	db := createWorkerTestDB(t, ctx)

@@ -364,6 +364,19 @@ func (w *Worker) logPollError(ctx context.Context, msg string, fields map[string
 	w.client.logError(ctx, msg, fields)
 }
 
+// notifyFailed marks job permanently failed with cause and, if configured,
+// hands it to OnJobFailed. The explicit-NonRetryable path and the
+// retry-exhausted path reach this outcome through different mechanisms, but
+// it is the same outcome, so both funnel through here.
+func (w *Worker) notifyFailed(ctx context.Context, job *Job, cause error) {
+	if w.cfg.OnJobFailed == nil {
+		return
+	}
+	job.Status = StatusFailed
+	job.LastError = sql.NullString{String: cause.Error(), Valid: true}
+	w.cfg.OnJobFailed(ctx, *job)
+}
+
 func (w *Worker) runOnce(ctx context.Context) {
 	for _, queueName := range w.registry.queueNames() {
 		h, ok := w.registry.get(queueName)
@@ -388,10 +401,8 @@ func (w *Worker) runOnce(ctx context.Context) {
 				if IsNonRetryable(err) {
 					if failErr := w.client.Fail(ctx, job.ID, err); failErr != nil {
 						w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
-					} else if w.cfg.OnJobFailed != nil {
-						job.Status = StatusFailed
-						job.LastError = sql.NullString{String: err.Error(), Valid: true}
-						w.cfg.OnJobFailed(ctx, *job)
+					} else {
+						w.notifyFailed(ctx, job, err)
 					}
 					continue
 				}
@@ -399,11 +410,9 @@ func (w *Worker) runOnce(ctx context.Context) {
 				delay := w.cfg.RetryDelay(*job, err)
 				if retryErr := w.client.Retry(ctx, job.ID, delay, err); retryErr != nil {
 					w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
-				} else if job.Attempts >= job.MaxAttempts && w.cfg.OnJobFailed != nil {
+				} else if job.Attempts >= job.MaxAttempts {
 					// Retry's zombie-prevention moved it to failed.
-					job.Status = StatusFailed
-					job.LastError = sql.NullString{String: err.Error(), Valid: true}
-					w.cfg.OnJobFailed(ctx, *job)
+					w.notifyFailed(ctx, job, err)
 				}
 				continue
 			}
