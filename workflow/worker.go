@@ -198,7 +198,9 @@ func (w *Worker) handler(def *definition, config WorkerConfig) queue.Handler {
 // beginActivation takes ownership of the run named by job by bumping its lease,
 // which fences writes from any activation still running elsewhere. It returns nil
 // when the job is stale: the run finished, or a retry gave it a new job.
-func (c *Client) beginActivation(ctx context.Context, def *definition, config WorkerConfig, job queue.Job, runID string) (*activation, error) {
+func (c *Client) beginActivation(workerCtx context.Context, def *definition, config WorkerConfig, job queue.Job, runID string) (*activation, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), bookkeepingTimeout)
+	defer cancel()
 	act := &activation{
 		client:      c,
 		def:         def,
@@ -207,7 +209,7 @@ func (c *Client) beginActivation(ctx context.Context, def *definition, config Wo
 		runID:       runID,
 		checkpoints: map[string]checkpoint{},
 		occurrences: map[string]int{},
-		runCtx:      ctx,
+		runCtx:      workerCtx,
 	}
 	var (
 		input       []byte

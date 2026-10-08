@@ -303,7 +303,7 @@ func runAttempt[T any](act *activation, key string, config stepConfig, transacti
 	}
 	if !transactional {
 		value, err := callStep(act, stepCtx, fn, nil)
-		if act.runCtx.Err() != nil {
+		if err != nil && act.runCtx.Err() != nil {
 			return attempt[T]{stop: act.interruptAttempt(key)}
 		}
 		if err != nil {
@@ -329,7 +329,7 @@ func runAttempt[T any](act *activation, key string, config stepConfig, transacti
 	}
 	defer func() { _ = tx.Rollback() }()
 	value, err := callStep(act, stepCtx, fn, tx)
-	if act.runCtx.Err() != nil {
+	if err != nil && act.runCtx.Err() != nil {
 		_ = tx.Rollback()
 		return attempt[T]{stop: act.interruptAttempt(key)}
 	}
@@ -603,7 +603,9 @@ func awaitChild[Out any](act *activation, key string) (Out, error) {
 		return zero, fmt.Errorf("workflow: child %q was not started", key)
 	}
 	if cp.status == StepWaiting {
-		child, err := act.client.GetRun(act.runCtx, cp.childRunID)
+		ctx, cancel := act.bookkeepingContext()
+		child, err := act.client.GetRun(ctx, cp.childRunID)
+		cancel()
 		if err != nil {
 			return zero, act.infrastructureFailure(err)
 		}

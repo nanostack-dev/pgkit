@@ -387,3 +387,40 @@ func TestRetryHonorsASubSecondDelay(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	requireClaimable(t, q, queueName, true)
 }
+
+func TestAHandlerFinishingDuringShutdownStillSettlesItsJob(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	worker, err := q.Worker("stopping").Pickup(PollEvery(10*time.Millisecond)).HandleRaw(queueName, func(context.Context, Job) error {
+		close(reached)
+		<-release
+		return nil
+	}).Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	id, err := q.Enqueue(context.Background(), EnqueueParams{QueueName: queueName, Payload: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	<-reached
+
+	cancel()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	job, err := q.GetJob(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if job.Status != StatusDone {
+		t.Fatalf("status = %s, want done", job.Status)
+	}
+}

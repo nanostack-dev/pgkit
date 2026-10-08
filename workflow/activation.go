@@ -105,10 +105,16 @@ func (a *activation) stopWith(reason stopReason, err error) error {
 	return a.stopErr
 }
 
+// stopped reports why the activation must not start new work, if it must: a
+// suspension, a failure, or the end of the run context.
 func (a *activation) stopped() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.stopErr
+	stopErr := a.stopErr
+	a.mu.Unlock()
+	if stopErr == nil && a.runCtx.Err() != nil {
+		return a.interruption()
+	}
+	return stopErr
 }
 
 func (a *activation) stopState() (stopReason, error) {
@@ -323,6 +329,9 @@ func (a *activation) execute(workerCtx context.Context) error {
 			a.interruption()
 		} else {
 			output, err = a.executeFunction()
+		}
+		if reason, _ := a.stopState(); reason == infrastructureFailed && a.runCtx.Err() != nil {
+			a.interruption()
 		}
 		reason, stopErr := a.stopState()
 		switch reason {

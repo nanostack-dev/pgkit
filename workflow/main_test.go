@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -224,9 +225,32 @@ func mustResult[Out any](h *harness, run Run[Out]) Out {
 	h.t.Helper()
 	output, err := result(h, run)
 	if err != nil {
-		h.t.Fatalf("run %s: %v", run.ID, err)
+		h.t.Fatalf("run %s: %v\n%s", run.ID, err, h.dump(run.ID))
 	}
 	return output
+}
+
+// dump describes a run, its checkpoints and its job, for failure messages.
+func (h *harness) dump(runID string) string {
+	ctx := context.Background()
+	var out strings.Builder
+	if run, err := h.client.GetRun(ctx, runID); err == nil {
+		fmt.Fprintf(&out, "run: status=%s wake=%v lease=%d error=%q\n", run.Status, run.WakeAt, h.lease(runID), run.Error)
+	}
+	if steps, err := h.client.ListSteps(ctx, runID); err == nil {
+		for _, step := range steps {
+			fmt.Fprintf(&out, "  step %s kind=%s status=%s attempts=%d wake=%v child=%s\n", step.Name, step.Kind, step.Status, step.Attempts, step.WakeAt, step.ChildRunID)
+		}
+	}
+	var status, claimedBy sql.NullString
+	var attempts int
+	var availableAt, claimedAt sql.NullTime
+	err := h.db.QueryRowContext(ctx, `SELECT j.status, j.attempts, j.available_at, j.claimed_by, j.claimed_at
+		FROM pgqueue_jobs j JOIN pgworkflow_runs r ON r.job_id = j.id WHERE r.id = $1`, runID).
+		Scan(&status, &attempts, &availableAt, &claimedBy, &claimedAt)
+	fmt.Fprintf(&out, "job: status=%s attempts=%d available=%v claimed_by=%s claimed_at=%v err=%v now=%v\n",
+		status.String, attempts, availableAt.Time, claimedBy.String, claimedAt.Time, err, time.Now().UTC())
+	return out.String()
 }
 
 func mustStart[In, Out any](h *harness, w *Workflow[In, Out], input In, options ...StartOption) Run[Out] {
