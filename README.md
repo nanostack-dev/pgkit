@@ -89,9 +89,19 @@ Notifications are hints, so the worker still rescans: delayed jobs and retries
 are picked up within one rescan interval of falling due, and the listener scans
 once each time it (re)connects to recover anything sent while it was down. All
 workers of a `Client` share one `LISTEN` connection, opened outside the `*sql.DB`
-pool. `OnEnqueue` needs the pgx stdlib driver; `NewWorker` returns
-`ErrNotificationsUnsupported` otherwise. `Worker.Ready()` closes once the worker
-has scanned while able to notice every later job.
+pool. With the pgx stdlib driver it is configured like the pool's connections.
+With any other driver (lib/pq, instrumentation wrappers), give it a connection
+before building workers, or `Build` returns `ErrNotificationsUnsupported`:
+
+```go
+err := client.ListenOn(postgresConfig.DSN())            // URL or key=value DSN
+client.ListenWith(func(ctx context.Context) (*pgx.Conn, error) {
+    return pgx.ConnectConfig(ctx, freshConfigWithRotatedPassword())
+})
+```
+
+`Worker.Ready()` closes after the first scan in which every claim succeeded with
+the listener up; from then on a newly claimable job wakes the worker.
 
 `PollInterval` still works and means `PollEvery(PollInterval)`; set it or
 `Pickup`, not both.

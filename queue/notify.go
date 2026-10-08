@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -16,7 +15,7 @@ import (
 
 // NotifyChannel receives a notification each time a job may have become claimable:
 // enqueued, replayed or requeued by the reaper. The payload is the queue name cut
-// to notifyKeyLength characters, which keeps it under the 8000-byte NOTIFY limit.
+// to 200 characters, which keeps it under the 8000-byte NOTIFY limit.
 const NotifyChannel = "pgqueue_jobs"
 
 const (
@@ -25,7 +24,9 @@ const (
 	listenerCloseBudget = time.Second
 )
 
-// notifySQL notifies for every row of the named CTE; it must agree with notifyKey.
+var ErrNotificationsUnsupported = errors.New(
+	"pgqueue: OnEnqueue pickup needs the pgx stdlib driver, Client.ListenOn or Client.ListenWith")
+
 func notifySQL(cte string) string {
 	return fmt.Sprintf("pg_notify('%s', left(%s.queue_name, %d))", NotifyChannel, cte, notifyKeyLength)
 }
@@ -38,23 +39,50 @@ func notifyKey(queueName string) string {
 	return string(runes[:notifyKeyLength])
 }
 
-var ErrNotificationsUnsupported = errors.New("pgqueue: OnEnqueue pickup needs the pgx stdlib driver")
-
-func supportsNotifications(db *sql.DB) bool {
-	_, ok := db.Driver().(*stdlib.Driver)
-	return ok
+// ListenOn makes OnEnqueue workers listen on connections opened from connString
+// (URL or key=value DSN). Call it before building workers when db does not use the
+// pgx stdlib driver, lib/pq included.
+func (c *Client) ListenOn(connString string) error {
+	config, err := pgx.ParseConfig(connString)
+	if err != nil {
+		return fmt.Errorf("pgqueue: listener connection string: %w", err)
+	}
+	c.ListenWith(func(ctx context.Context) (*pgx.Conn, error) {
+		return pgx.ConnectConfig(ctx, config.Copy())
+	})
+	return nil
 }
 
-// notifier shares one LISTEN connection between all subscribed workers of a
-// Client. It runs while at least one worker is subscribed.
+// ListenWith makes OnEnqueue workers listen on connections from connect, called
+// on every (re)connect. Use it when credentials rotate or a connection needs setup
+// that a connection string cannot express.
+func (c *Client) ListenWith(connect func(context.Context) (*pgx.Conn, error)) {
+	c.notifier.mu.Lock()
+	defer c.notifier.mu.Unlock()
+	c.notifier.connect = connect
+}
+
+func (c *Client) supportsNotifications() bool {
+	c.notifier.mu.Lock()
+	configured := c.notifier.connect != nil
+	c.notifier.mu.Unlock()
+	_, pgxPool := c.db.Driver().(*stdlib.Driver)
+	return configured || pgxPool
+}
+
+// notifier shares one LISTEN connection between the subscribed workers of a
+// Client, while at least one is subscribed. Each listener run has a generation,
+// so a run that is shutting down cannot overwrite the state of its successor.
 type notifier struct {
 	client *Client
 
-	mu        sync.Mutex
-	subs      map[*subscription]struct{}
-	listening bool
-	stop      context.CancelFunc
-	stopped   chan struct{}
+	mu         sync.Mutex
+	connect    func(context.Context) (*pgx.Conn, error)
+	subs       map[*subscription]struct{}
+	generation uint64
+	listening  bool
+	stop       context.CancelFunc
+	stopped    chan struct{}
 
 	beforeConnect func()
 }
@@ -79,9 +107,10 @@ func (n *notifier) subscribe(queueNames []string) *subscription {
 	defer n.mu.Unlock()
 	n.subs[sub] = struct{}{}
 	if n.stop == nil {
+		n.generation++
 		ctx, stop := context.WithCancel(context.Background())
 		n.stop, n.stopped = stop, make(chan struct{})
-		go n.run(ctx, n.stopped)
+		go n.run(ctx, n.generation, n.stopped)
 	} else if n.listening {
 		sub.listening.Store(true)
 		signal(sub.wake)
@@ -98,17 +127,18 @@ func (n *notifier) unsubscribe(sub *subscription) {
 	}
 	stop, stopped := n.stop, n.stopped
 	n.stop, n.stopped, n.listening = nil, nil, false
+	n.generation++
 	n.mu.Unlock()
 
 	stop()
 	<-stopped
 }
 
-func (n *notifier) run(ctx context.Context, stopped chan<- struct{}) {
+func (n *notifier) run(ctx context.Context, generation uint64, stopped chan<- struct{}) {
 	defer close(stopped)
 	for {
-		err := n.listen(ctx)
-		n.setListening(false)
+		err := n.listen(ctx, generation)
+		n.setListening(generation, false)
 		if ctx.Err() != nil {
 			return
 		}
@@ -121,13 +151,13 @@ func (n *notifier) run(ctx context.Context, stopped chan<- struct{}) {
 	}
 }
 
-func (n *notifier) listen(ctx context.Context) error {
+func (n *notifier) listen(ctx context.Context, generation uint64) error {
 	if n.beforeConnect != nil {
 		n.beforeConnect()
 	}
-	conn, err := n.connect(ctx)
+	conn, err := n.open(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("pgqueue: open listener connection: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listenerCloseBudget)
@@ -138,50 +168,61 @@ func (n *notifier) listen(ctx context.Context) error {
 	if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
 		return fmt.Errorf("pgqueue: listen: %w", err)
 	}
-	n.setListening(true)
+	n.setListening(generation, true)
 	for {
 		notification, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return fmt.Errorf("pgqueue: wait for notification: %w", err)
 		}
-		n.dispatch(notification)
+		n.dispatch(generation, notification)
 	}
 }
 
-// connect opens a connection outside the *sql.DB pool, configured like the pool's
-// own connections, so listening never takes a slot from the application.
-func (n *notifier) connect(ctx context.Context) (*pgx.Conn, error) {
+// open dials outside the *sql.DB pool, so listening never holds a slot the
+// application needs.
+func (n *notifier) open(ctx context.Context) (*pgx.Conn, error) {
+	n.mu.Lock()
+	connect := n.connect
+	n.mu.Unlock()
+	if connect != nil {
+		return connect(ctx)
+	}
+
+	config, err := n.poolConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	config.OnNotification = nil
+	return pgx.ConnectConfig(ctx, config)
+}
+
+func (n *notifier) poolConfig(ctx context.Context) (*pgx.ConnConfig, error) {
 	pooled, err := n.client.db.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("pgqueue: read connection config: %w", err)
+		return nil, err
 	}
 	defer func() { _ = pooled.Close() }()
 
 	var config *pgx.ConnConfig
-	if err := pooled.Raw(func(driverConn any) error {
+	err = pooled.Raw(func(driverConn any) error {
 		stdConn, ok := driverConn.(*stdlib.Conn)
 		if !ok {
 			return ErrNotificationsUnsupported
 		}
 		config = stdConn.Conn().Config()
 		return nil
-	}); err != nil {
-		return nil, err
-	}
-	config.OnNotification = nil
-
-	conn, err := pgx.ConnectConfig(ctx, config)
-	if err != nil {
-		return nil, fmt.Errorf("pgqueue: open listener connection: %w", err)
-	}
-	return conn, nil
+	})
+	return config, err
 }
 
-// setListening wakes every subscriber when listening starts: anything enqueued
-// before LISTEN took effect produced no notification this connection will see.
-func (n *notifier) setListening(listening bool) {
+// setListening wakes every subscriber when listening starts: a job enqueued before
+// LISTEN took effect sent a notification this connection never sees.
+func (n *notifier) setListening(generation uint64, listening bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if generation != n.generation {
+		return
+	}
 	n.listening = listening
 	for sub := range n.subs {
 		sub.listening.Store(listening)
@@ -191,9 +232,14 @@ func (n *notifier) setListening(listening bool) {
 	}
 }
 
-func (n *notifier) dispatch(notification *pgconn.Notification) {
+// dispatch wakes every subscriber on a nil notification, which a connection with
+// its own OnNotification handler returns.
+func (n *notifier) dispatch(generation uint64, notification *pgconn.Notification) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if generation != n.generation {
+		return
+	}
 	for sub := range n.subs {
 		if notification == nil {
 			signal(sub.wake)

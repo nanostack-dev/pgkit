@@ -1,7 +1,6 @@
 package queue
 
 import (
-	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -14,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,6 +24,7 @@ var (
 	ErrInvalidWorkerConfig = errors.New("pgqueue: invalid worker config")
 	ErrHandlerAlreadySet   = errors.New("pgqueue: handler already registered for queue")
 	ErrInvalidHandler      = errors.New("pgqueue: handler is nil")
+	ErrWorkerRunning       = errors.New("pgqueue: worker is already running")
 )
 
 // PostgreSQL SQLSTATE codes that mark the queue database as unreachable, shutting
@@ -270,7 +271,11 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 		c.WorkerID = "pgqueue-worker"
 	}
 	if c.Pickup.isZero() {
-		c.Pickup = PollEvery(cmp.Or(c.PollInterval, time.Second))
+		interval := c.PollInterval
+		if interval <= 0 {
+			interval = time.Second
+		}
+		c.Pickup = PollEvery(interval)
 	}
 	if c.ReapInterval <= 0 {
 		c.ReapInterval = 30 * time.Second
@@ -317,6 +322,7 @@ type Worker struct {
 	cfg       WorkerConfig
 	ready     chan struct{}
 	readyOnce sync.Once
+	running   atomic.Bool
 }
 
 func NewWorker(client *Client, registry *HandlerRegistry, cfg WorkerConfig) (*Worker, error) {
@@ -327,29 +333,34 @@ func NewWorker(client *Client, registry *HandlerRegistry, cfg WorkerConfig) (*Wo
 		return nil, ErrNilRegistry
 	}
 
-	if cfg.PollInterval != 0 && !cfg.Pickup.isZero() {
+	if cfg.PollInterval > 0 && !cfg.Pickup.isZero() {
 		return nil, fmt.Errorf("%w: set Pickup or PollInterval, not both", ErrInvalidWorkerConfig)
 	}
 	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if cfg.Pickup.onEnqueue && !supportsNotifications(client.db) {
+	if cfg.Pickup.onEnqueue && !client.supportsNotifications() {
 		return nil, ErrNotificationsUnsupported
 	}
 
 	return &Worker{client: client, registry: registry, cfg: cfg, ready: make(chan struct{})}, nil
 }
 
-// Ready is closed once the worker has completed a scan of its queues while able to
-// see every later job: after its first scan, or with OnEnqueue, after its first
-// scan once the listener is up. A job enqueued after Ready needs no rescan.
+// Ready is closed after the worker's first scan in which every claim succeeded and,
+// with OnEnqueue, its listener was up: from then on a job that becomes claimable
+// wakes it. Delayed jobs and retries still wait for the next scan once due.
 func (w *Worker) Ready() <-chan struct{} {
 	return w.ready
 }
 
-// Run blocks until context is canceled.
+// Run blocks until context is canceled. A Worker runs at most once at a time.
 func (w *Worker) Run(ctx context.Context) error {
+	if !w.running.CompareAndSwap(false, true) {
+		return ErrWorkerRunning
+	}
+	defer w.running.Store(false)
+
 	scanTicker := time.NewTicker(w.cfg.Pickup.scanEvery)
 	defer scanTicker.Stop()
 
@@ -372,10 +383,11 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		scanSeesEveryLaterJob := seesEveryLaterJob()
-		if w.scan(ctx) {
+		result := w.scan(ctx)
+		if result.batchFilled {
 			signal(wake)
 		}
-		if scanSeesEveryLaterJob {
+		if scanSeesEveryLaterJob && !result.claimFailed {
 			w.readyOnce.Do(func() { close(w.ready) })
 		}
 	}
@@ -393,10 +405,14 @@ func (w *Worker) listen() (wake chan struct{}, seesEveryLaterJob func() bool, st
 	return sub.wake, sub.listening.Load, func() { w.client.notifier.unsubscribe(sub) }
 }
 
-// scan claims and handles up to a batch per queue. It reports whether a queue
-// filled its batch and may hold more claimable jobs.
-func (w *Worker) scan(ctx context.Context) bool {
-	more := false
+type scanResult struct {
+	batchFilled bool
+	claimFailed bool
+}
+
+// scan claims and handles up to a batch per queue.
+func (w *Worker) scan(ctx context.Context) scanResult {
+	var result scanResult
 	for _, queueName := range w.registry.queueNames() {
 		h, ok := w.registry.get(queueName)
 		if !ok {
@@ -408,6 +424,7 @@ func (w *Worker) scan(ctx context.Context) bool {
 			job, found, err := w.client.Claim(ctx, queueName, w.cfg.WorkerID)
 			if err != nil {
 				w.client.logFailure(ctx, "queue claim failed", map[string]any{"queue": queueName, "error": err.Error()}, err)
+				result.claimFailed = true
 				break
 			}
 			if !found || job == nil {
@@ -446,10 +463,10 @@ func (w *Worker) scan(ctx context.Context) bool {
 			}
 		}
 		if claimed == w.cfg.BatchSizePerQueue {
-			more = true
+			result.batchFilled = true
 		}
 	}
-	return more
+	return result
 }
 
 func (w *Worker) reap(ctx context.Context) error {

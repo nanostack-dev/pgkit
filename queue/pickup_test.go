@@ -6,9 +6,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // noRescan keeps OnEnqueue workers from finding jobs by scanning, so every claim in
@@ -235,6 +239,8 @@ func TestOnEnqueueRecoversJobsMissedWhileTheListenerWasDown(t *testing.T) {
 	var connects atomic.Int32
 	reconnecting := make(chan struct{})
 	reconnect := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(reconnect) }) }
 	h.q.notifier.beforeConnect = func() {
 		if connects.Add(1) == 2 {
 			close(reconnecting)
@@ -242,6 +248,7 @@ func TestOnEnqueueRecoversJobsMissedWhileTheListenerWasDown(t *testing.T) {
 		}
 	}
 	h.start(w)
+	t.Cleanup(release)
 
 	var terminated bool
 	if err := h.db.QueryRowContext(h.ctx,
@@ -249,10 +256,14 @@ func TestOnEnqueueRecoversJobsMissedWhileTheListenerWasDown(t *testing.T) {
 		Scan(&terminated); err != nil || !terminated {
 		t.Fatalf("terminate listener: terminated=%v err=%v", terminated, err)
 	}
-	<-reconnecting
+	select {
+	case <-reconnecting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener never tried to reconnect")
+	}
 	h.enqueue(w.queue)
 	w.requireCallsStay(t, 0)
-	close(reconnect)
+	release()
 	w.requireCalls(t, 1)
 }
 
@@ -308,7 +319,7 @@ func TestNilNotificationWakesEveryWorker(t *testing.T) {
 	first := &subscription{keys: map[string]struct{}{"a": {}}, wake: make(chan struct{}, 1)}
 	second := &subscription{keys: map[string]struct{}{"b": {}}, wake: make(chan struct{}, 1)}
 	n.subs[first], n.subs[second] = struct{}{}, struct{}{}
-	n.dispatch(nil)
+	n.dispatch(n.generation, nil)
 	for _, sub := range []*subscription{first, second} {
 		select {
 		case <-sub.wake:
@@ -377,5 +388,113 @@ func TestOnEnqueueRefusesDriversWithoutNotifications(t *testing.T) {
 	_, err = NewWorker(q, NewHandlerRegistry(), WorkerConfig{Pickup: OnEnqueue()})
 	if !errors.Is(err, ErrNotificationsUnsupported) {
 		t.Fatalf("expected ErrNotificationsUnsupported, got %v", err)
+	}
+}
+
+// foreignDriver hides the pgx stdlib driver from database/sql, like lib/pq or an
+// instrumentation wrapper would, while the connections still work.
+type foreignDriver struct{ driver.Driver }
+
+type foreignConnector struct{ driver.Connector }
+
+func (foreignConnector) Driver() driver.Driver { return foreignDriver{} }
+
+func openForeignDriverDB(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+	ctx := context.Background()
+	pg, connString := startWorkerPostgres(t, ctx)
+	t.Cleanup(func() { _ = pg.Terminate(ctx) })
+	config, err := pgx.ParseConfig(connString)
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	db := sql.OpenDB(foreignConnector{stdlib.GetConnector(*config)})
+	t.Cleanup(func() { _ = db.Close() })
+	if err := waitWorkerPing(ctx, db, 20*time.Second); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	return db, connString
+}
+
+func TestOnEnqueueWithAnotherDriverNeedsListenOn(t *testing.T) {
+	db, _ := openForeignDriverDB(t)
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	_, err = q.Worker("foreign").Pickup(OnEnqueue()).HandleRaw("foreign", func(context.Context, Job) error { return nil }).Build()
+	if !errors.Is(err, ErrNotificationsUnsupported) {
+		t.Fatalf("expected ErrNotificationsUnsupported, got %v", err)
+	}
+}
+
+func TestOnEnqueueListensOnTheGivenConnectionString(t *testing.T) {
+	db, connString := openForeignDriverDB(t)
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if err := q.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	if err := q.ListenOn(connString); err != nil {
+		t.Fatalf("listen on: %v", err)
+	}
+	h := &pickupHarness{t: t, ctx: context.Background(), db: db, q: q}
+	w := h.newWorker("listen_on", 10)
+	h.start(w)
+	h.enqueue(w.queue)
+	w.requireCalls(t, 1)
+}
+
+func TestListenOnRefusesAnInvalidConnectionString(t *testing.T) {
+	q, err := New(openWithoutConnecting(t))
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if err := q.ListenOn("postgres://%zz"); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestWorkerRefusesToRunTwiceAtOnce(t *testing.T) {
+	h := newPickupHarness(t)
+	w := h.newWorker("twice", 10)
+	h.start(w)
+	if err := w.Run(h.ctx); !errors.Is(err, ErrWorkerRunning) {
+		t.Fatalf("expected ErrWorkerRunning, got %v", err)
+	}
+}
+
+func TestWorkerIsNotReadyWhileClaimsFail(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkerTestDB(t, ctx)
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	h := &pickupHarness{t: t, ctx: ctx, db: db, q: q}
+	w := h.newWorker("no_schema_yet", 10)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = w.Run(runCtx) }()
+	select {
+	case <-w.Ready():
+		t.Fatal("ready although every claim failed")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestNegativePollIntervalMeansTheDefault(t *testing.T) {
+	q, err := New(openWithoutConnecting(t))
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	worker, err := NewWorker(q, NewHandlerRegistry(), WorkerConfig{PollInterval: -1})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	if worker.cfg.Pickup != PollEvery(time.Second) {
+		t.Fatalf("unexpected pickup: %+v", worker.cfg.Pickup)
 	}
 }

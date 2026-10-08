@@ -22,8 +22,9 @@ func PollEvery(interval time.Duration) Pickup {
 // pick up delayed jobs and retries as they fall due, and anything sent while its
 // listener was reconnecting.
 //
-// It needs the pgx stdlib driver. All workers of a Client share one dedicated
-// LISTEN connection, opened outside the *sql.DB pool.
+// All workers of a Client share one dedicated LISTEN connection, opened outside
+// the *sql.DB pool. It is configured like the pool's connections with the pgx
+// stdlib driver; with any other driver, give it one with Client.ListenOn.
 func OnEnqueue() Pickup {
 	return Pickup{onEnqueue: true, scanEvery: defaultRescanInterval}
 }
