@@ -2,9 +2,9 @@ package queue
 
 import (
 	"context"
-	"encoding/json"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
