@@ -47,3 +47,6 @@ node_modules/
 
 # Agent worktrees, created by git worktree add
 worktrees/
+
+# Developer-only Claude settings
+/.claude/settings.local.json

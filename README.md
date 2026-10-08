@@ -4,6 +4,8 @@ PostgreSQL primitives for distributed systems in Go.
 
 Requires Go 1.27 or newer (typed queue handles use generic methods).
 
+Standalone contributor setup, architecture, tests and release procedures: [docs/README.md](docs/README.md). Agent rules: [AGENTS.md](AGENTS.md); canonical vocabulary: [CONTEXT.md](CONTEXT.md).
+
 Install:
 
 ```bash
