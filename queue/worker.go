@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
@@ -23,6 +24,8 @@ var (
 	ErrInvalidWorkerConfig = errors.New("pgqueue: invalid worker config")
 	ErrHandlerAlreadySet   = errors.New("pgqueue: handler already registered for queue")
 	ErrInvalidHandler      = errors.New("pgqueue: handler is nil")
+
+	errListenUnsupported = errors.New("pgqueue: wake on enqueue needs the pgx stdlib driver")
 )
 
 // PostgreSQL SQLSTATE codes that mark the queue database as unreachable, shutting
@@ -240,8 +243,14 @@ func RegisterJSON[T any](
 type RetryDelayFunc func(job Job, cause error) time.Duration
 
 type WorkerConfig struct {
-	WorkerID          string
-	PollInterval      time.Duration
+	WorkerID     string
+	PollInterval time.Duration
+	// WakeOnEnqueue holds one pool connection that LISTENs on NotifyChannel and
+	// claims as soon as a job for a registered queue becomes claimable. PollInterval
+	// then only bounds how late delayed jobs, retries and missed notifications are
+	// picked up, so it can be seconds instead of milliseconds. Needs the pgx stdlib
+	// driver; with another driver the worker logs a warning and only polls.
+	WakeOnEnqueue     bool
 	ReapInterval      time.Duration
 	VisibilityTimeout time.Duration
 	BatchSizePerQueue int
@@ -336,18 +345,87 @@ func (w *Worker) Run(ctx context.Context) error {
 	reapTicker := time.NewTicker(w.cfg.ReapInterval)
 	defer reapTicker.Stop()
 
+	wake := make(chan struct{}, 1)
+	if w.cfg.WakeOnEnqueue {
+		listenCtx, stopListening := context.WithCancel(ctx)
+		var listening sync.WaitGroup
+		listening.Go(func() { w.listen(listenCtx, wake) })
+		defer listening.Wait()
+		defer stopListening()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-pollTicker.C:
-			w.runOnce(ctx)
+		case <-wake:
 		case <-reapTicker.C:
 			if err := w.reap(ctx); err != nil {
 				w.logPollError(ctx, "queue reap cycle failed", map[string]any{"error": err.Error()}, err)
 			}
+			continue
+		}
+		if w.runOnce(ctx) {
+			signal(wake)
 		}
 	}
+}
+
+func signal(wake chan<- struct{}) {
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *Worker) listen(ctx context.Context, wake chan<- struct{}) {
+	for ctx.Err() == nil {
+		err := w.listenOnce(ctx, wake)
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errListenUnsupported) {
+			w.client.logWarn(ctx, "queue wake on enqueue disabled, polling only", map[string]any{"error": err.Error()})
+			return
+		}
+		w.logPollError(ctx, "queue listen failed", map[string]any{"error": err.Error()}, err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(min(time.Second, w.cfg.PollInterval)):
+		}
+	}
+}
+
+// listenOnce always discards its connection: a session still LISTENing must never
+// return to the pool, where it would queue notifications nobody reads.
+func (w *Worker) listenOnce(ctx context.Context, wake chan<- struct{}) error {
+	conn, err := w.client.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("pgqueue: listen connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	return conn.Raw(func(driverConn any) error {
+		stdConn, ok := driverConn.(*stdlib.Conn)
+		if !ok {
+			return errors.Join(errListenUnsupported, driver.ErrBadConn)
+		}
+		pgxConn := stdConn.Conn()
+		if _, err := pgxConn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
+			return errors.Join(fmt.Errorf("pgqueue: listen: %w", err), driver.ErrBadConn)
+		}
+		signal(wake)
+		for {
+			notification, err := pgxConn.WaitForNotification(ctx)
+			if err != nil {
+				return errors.Join(fmt.Errorf("pgqueue: wait for notification: %w", err), driver.ErrBadConn)
+			}
+			if _, ok := w.registry.get(notification.Payload); ok {
+				signal(wake)
+			}
+		}
+	})
 }
 
 // logPollError logs a failure from the worker's periodic poll loop. A connectivity
@@ -364,14 +442,17 @@ func (w *Worker) logPollError(ctx context.Context, msg string, fields map[string
 	w.client.logError(ctx, msg, fields)
 }
 
-func (w *Worker) runOnce(ctx context.Context) {
+// runOnce reports whether a queue filled its batch and may hold more claimable jobs.
+func (w *Worker) runOnce(ctx context.Context) bool {
+	more := false
 	for _, queueName := range w.registry.queueNames() {
 		h, ok := w.registry.get(queueName)
 		if !ok {
 			continue
 		}
 
-		for i := 0; i < w.cfg.BatchSizePerQueue; i++ {
+		claimed := 0
+		for ; claimed < w.cfg.BatchSizePerQueue; claimed++ {
 			job, found, err := w.client.Claim(ctx, queueName, w.cfg.WorkerID)
 			if err != nil {
 				w.logPollError(ctx, "queue claim failed", map[string]any{"queue": queueName, "error": err.Error()}, err)
@@ -412,7 +493,11 @@ func (w *Worker) runOnce(ctx context.Context) {
 				w.client.logError(ctx, "queue ack failed", map[string]any{"id": job.ID, "error": ackErr.Error()})
 			}
 		}
+		if claimed == w.cfg.BatchSizePerQueue {
+			more = true
+		}
 	}
+	return more
 }
 
 func (w *Worker) reap(ctx context.Context) error {

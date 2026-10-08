@@ -319,8 +319,11 @@ type PublishResult struct {
 }
 
 type WorkerConfig struct {
-	WorkerID          string
-	PollInterval      time.Duration
+	WorkerID     string
+	PollInterval time.Duration
+	// WakeOnEnqueue starts each step as soon as it is enqueued; see
+	// queue.WorkerConfig.WakeOnEnqueue. PollInterval then only bounds retries.
+	WakeOnEnqueue     bool
 	ReapInterval      time.Duration
 	VisibilityTimeout time.Duration
 	BatchSizePerQueue int

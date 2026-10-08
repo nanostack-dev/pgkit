@@ -30,6 +30,10 @@ var (
 // Types
 // ---------------------------------------------------------------------------
 
+// NotifyChannel carries the queue name of every job that becomes claimable now:
+// enqueued, replayed or requeued by the reaper. Delivery happens at commit.
+const NotifyChannel = "pgqueue_jobs"
+
 // JobStatus represents the lifecycle state of a job.
 type JobStatus string
 
@@ -367,16 +371,22 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 	if p.AvailableAt == nil {
 		// P0 #4: Use DB NOW() for immediate jobs to avoid clock skew.
 		err = qe.QueryRowContext(ctx,
-			`INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-			 VALUES ($1, $2, 'pending', 0, $3, NOW())
-			 RETURNING id`,
+			`WITH job AS (
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
+				VALUES ($1, $2, 'pending', 0, $3, NOW())
+				RETURNING id, queue_name
+			 )
+			 SELECT job.id FROM job, pg_notify('`+NotifyChannel+`', job.queue_name)`,
 			p.QueueName, p.Payload, p.MaxAttempts,
 		).Scan(&id)
 	} else {
 		err = qe.QueryRowContext(ctx,
-			`INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-			 VALUES ($1, $2, 'pending', 0, $3, $4)
-			 RETURNING id`,
+			`WITH job AS (
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
+				VALUES ($1, $2, 'pending', 0, $3, $4)
+				RETURNING id, queue_name
+			 )
+			 SELECT job.id FROM job, pg_notify('`+NotifyChannel+`', job.queue_name)`,
 			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(),
 		).Scan(&id)
 	}
@@ -634,15 +644,19 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 
 	// Requeue: processing + stale + attempts < max_attempts -> pending
 	resRequeue, err := c.db.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-		 SET status = 'pending',
-		     claimed_by = NULL,
-		     claimed_at = NULL,
-		     available_at = NOW(),
-		     updated_at = NOW()
-		 WHERE status = 'processing'
-		   AND claimed_at < NOW() - $1::interval
-		   AND attempts < max_attempts`,
+		`WITH requeued AS (
+			UPDATE pgqueue_jobs
+			SET status = 'pending',
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    available_at = NOW(),
+			    updated_at = NOW()
+			WHERE status = 'processing'
+			  AND claimed_at < NOW() - $1::interval
+			  AND attempts < max_attempts
+			RETURNING queue_name
+		 )
+		 SELECT 1 FROM requeued, pg_notify('`+NotifyChannel+`', requeued.queue_name)`,
 		fmt.Sprintf("%d seconds", int(visibilityTimeout.Seconds())),
 	)
 	if err != nil {
@@ -847,17 +861,21 @@ func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	}
 
 	res, err := exec.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-         SET status = 'pending',
-             attempts = 0,
-             available_at = NOW(),
-             claimed_by = NULL,
-             claimed_at = NULL,
-             done_at = NULL,
-             last_error = NULL,
-             updated_at = NOW()
-         WHERE id = $1
-           AND status IN ('done', 'failed')`,
+		`WITH replayed AS (
+			UPDATE pgqueue_jobs
+			SET status = 'pending',
+			    attempts = 0,
+			    available_at = NOW(),
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    done_at = NULL,
+			    last_error = NULL,
+			    updated_at = NOW()
+			WHERE id = $1
+			  AND status IN ('done', 'failed')
+			RETURNING queue_name
+		 )
+		 SELECT 1 FROM replayed, pg_notify('`+NotifyChannel+`', replayed.queue_name)`,
 		id,
 	)
 	if err != nil {

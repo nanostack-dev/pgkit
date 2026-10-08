@@ -278,6 +278,91 @@ func TestWorkflowWorkerExecutesDependentSteps(t *testing.T) {
 	}
 }
 
+func TestWorkflowWorkerWakeOnEnqueueRunsDependentStepsWithoutPolling(t *testing.T) {
+	ctx := context.Background()
+	db := createWorkflowTestDB(t, ctx)
+	queue := createWorkflowQueue(t, ctx, db)
+
+	var firstCalled atomic.Int32
+	var secondCalled atomic.Int32
+
+	def, err := Define("dependent_wake", func(b *Builder) {
+		b.Step("first", func(_ context.Context, step StepContext) (any, error) {
+			firstCalled.Add(1)
+			var input struct {
+				Name string `json:"name"`
+			}
+			if err := step.DecodeInput(&input); err != nil {
+				return nil, err
+			}
+			return map[string]any{"greeting": "hello " + input.Name}, nil
+		}, StepOptions{})
+		b.Step("second", func(_ context.Context, step StepContext) (any, error) {
+			secondCalled.Add(1)
+			var first struct {
+				Greeting string `json:"greeting"`
+			}
+			if err := step.Output("first", &first); err != nil {
+				return nil, err
+			}
+			return map[string]any{"message": first.Greeting + "!"}, nil
+		}, StepOptions{DependsOn: []string{"first"}})
+	})
+	if err != nil {
+		t.Fatalf("define: %v", err)
+	}
+
+	module, err := New(db, queue, def)
+	if err != nil {
+		t.Fatalf("new module: %v", err)
+	}
+	if err := module.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	if _, err := module.Publish(ctx, "dependent_wake"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := module.Activate(ctx, "dependent_wake", 1); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	worker, err := NewWorker(module, WorkerConfig{PollInterval: time.Hour, WakeOnEnqueue: true, ReapInterval: time.Hour, BatchSizePerQueue: 10})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { _ = worker.Run(workerCtx) }()
+
+	run, err := module.Start(ctx, "dependent_wake", map[string]any{"name": "rowan"}, nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	requireEventually(t, 6*time.Second, 50*time.Millisecond, func() bool {
+		view, err := module.GetRun(ctx, run.ID)
+		return err == nil && view.Run.Status == RunStatusSucceeded
+	})
+
+	if firstCalled.Load() != 1 || secondCalled.Load() != 1 {
+		t.Fatalf("unexpected step calls: first=%d second=%d", firstCalled.Load(), secondCalled.Load())
+	}
+	view, err := module.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run final: %v", err)
+	}
+	if len(view.Steps) != 2 {
+		t.Fatalf("expected 2 steps, got %d", len(view.Steps))
+	}
+	statuses := map[string]StepStatus{}
+	for _, step := range view.Steps {
+		statuses[step.StepName] = step.Status
+	}
+	if statuses["first"] != StepStatusSucceeded || statuses["second"] != StepStatusSucceeded {
+		t.Fatalf("unexpected step statuses: %+v", statuses)
+	}
+}
+
 func TestWorkflowTxStepPersistsAtomicData(t *testing.T) {
 	ctx := context.Background()
 	db := createWorkflowTestDB(t, ctx)
