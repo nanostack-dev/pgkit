@@ -9,7 +9,8 @@ import (
 
 // SnoozeTx returns a processing job to pending, claimable again at until, without
 // spending the attempt its claim used. A zero until parks the job until WakeTx makes
-// it due. Use database time for until, as the claim query compares it with NOW().
+// it due; a past until makes it due now. Use database time for until, as the claim
+// query compares it with NOW().
 func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, id int64, until time.Time) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
@@ -27,7 +28,7 @@ func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, id int64, until time.
 			UPDATE pgqueue_jobs
 			SET status = 'pending',
 			    attempts = GREATEST(attempts - 1, 0),
-			    available_at = COALESCE($2::timestamptz, 'infinity'),
+			    available_at = GREATEST(COALESCE($2::timestamptz, 'infinity'), NOW()),
 			    claimed_by = NULL,
 			    claimed_at = NULL,
 			    updated_at = NOW()

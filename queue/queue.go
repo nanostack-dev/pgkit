@@ -564,7 +564,7 @@ func retryCore(ctx context.Context, exec execer, id int64, delay time.Duration, 
 	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
-		     available_at = CASE WHEN attempts >= max_attempts THEN available_at ELSE NOW() + $2::interval END,
+		     available_at = CASE WHEN attempts >= max_attempts THEN available_at ELSE NOW() + make_interval(secs => $2) END,
 		     last_error = COALESCE($3, last_error),
 		     claimed_by = NULL,
 		     claimed_at = NULL,
@@ -572,7 +572,7 @@ func retryCore(ctx context.Context, exec execer, id int64, delay time.Duration, 
 		     updated_at = NOW()
 		 WHERE id = $1 AND status = 'processing'`,
 		id,
-		fmt.Sprintf("%d seconds", int(delay.Seconds())),
+		delay.Seconds(),
 		errMsg,
 	)
 	if err != nil {
@@ -664,12 +664,12 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 			    available_at = NOW(),
 			    updated_at = NOW()
 			WHERE status = 'processing'
-			  AND claimed_at < NOW() - $1::interval
+			  AND claimed_at < NOW() - make_interval(secs => $1)
 			  AND attempts < max_attempts
 			RETURNING queue_name
 		 )
 		 SELECT 1 FROM requeued, `+notifySQL("requeued"),
-		fmt.Sprintf("%d seconds", int(visibilityTimeout.Seconds())),
+		visibilityTimeout.Seconds(),
 	)
 	if err != nil {
 		return ReapResult{}, fmt.Errorf("pgqueue: reap requeue: %w", err)
@@ -686,9 +686,9 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 		     done_at = NOW(),
 		     updated_at = NOW()
 		 WHERE status = 'processing'
-		   AND claimed_at < NOW() - $1::interval
+		   AND claimed_at < NOW() - make_interval(secs => $1)
 		   AND attempts >= max_attempts`,
-		fmt.Sprintf("%d seconds", int(visibilityTimeout.Seconds())),
+		visibilityTimeout.Seconds(),
 	)
 	if err != nil {
 		return ReapResult{Requeued: requeued}, fmt.Errorf("pgqueue: reap fail: %w", err)
@@ -953,13 +953,13 @@ func (c *Client) Purge(ctx context.Context, p PurgeParams) (int64, error) {
 
 	query := `DELETE FROM pgqueue_jobs
 	          WHERE status = $1
-	            AND updated_at < NOW() - $2::interval`
-	args := []any{string(p.Status), fmt.Sprintf("%d seconds", int(p.OlderThan.Seconds()))}
+	            AND updated_at < NOW() - make_interval(secs => $2)`
+	args := []any{string(p.Status), p.OlderThan.Seconds()}
 
 	if p.Limit > 0 {
 		query = `DELETE FROM pgqueue_jobs WHERE id IN (
 			SELECT id FROM pgqueue_jobs
-			WHERE status = $1 AND updated_at < NOW() - $2::interval
+			WHERE status = $1 AND updated_at < NOW() - make_interval(secs => $2)
 			ORDER BY id ASC LIMIT $3
 		)` // subquery for LIMIT on DELETE
 		args = append(args, p.Limit)

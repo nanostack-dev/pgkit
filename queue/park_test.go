@@ -351,3 +351,39 @@ func TestSubscribeRefusesDriversWithoutNotifications(t *testing.T) {
 		t.Fatalf("expected ErrNotificationsUnsupported, got %v", err)
 	}
 }
+
+func TestReapStuckJobsHonorsASubSecondVisibilityTimeout(t *testing.T) {
+	q := sharedQueue(t)
+	job := enqueueAndClaim(t, q, uniqueQueueName(t), 3)
+
+	if _, err := q.ReapStuckJobs(context.Background(), 500*time.Millisecond); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if fresh, err := q.GetJob(context.Background(), job.ID); err != nil || fresh.Status != StatusProcessing {
+		t.Fatalf("a job claimed just now was reaped with a 500ms visibility timeout: %+v %v", fresh, err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if _, err := q.ReapStuckJobs(context.Background(), 500*time.Millisecond); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	reaped, err := q.GetJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if reaped.Status != StatusPending {
+		t.Fatalf("status = %s, want pending after the timeout", reaped.Status)
+	}
+}
+
+func TestRetryHonorsASubSecondDelay(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	job := enqueueAndClaim(t, q, queueName, 3)
+
+	if err := q.Retry(context.Background(), job.ID, 400*time.Millisecond, errors.New("blip")); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	requireClaimable(t, q, queueName, false)
+	time.Sleep(500 * time.Millisecond)
+	requireClaimable(t, q, queueName, true)
+}
