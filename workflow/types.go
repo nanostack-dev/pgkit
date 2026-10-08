@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	qpkg "github.com/nanostack-dev/pgkit/queue"
 )
 
 type DefinitionStatus string
@@ -319,11 +321,13 @@ type PublishResult struct {
 }
 
 type WorkerConfig struct {
-	WorkerID     string
-	PollInterval time.Duration
-	// WakeOnEnqueue starts each step as soon as it is enqueued; see
-	// queue.WorkerConfig.WakeOnEnqueue. PollInterval then only bounds retries.
-	WakeOnEnqueue     bool
+	WorkerID string
+	// Pickup decides when the worker looks for steps to run; see queue.Pickup.
+	// queue.OnEnqueue() starts each step as soon as it is enqueued. Set it or
+	// PollInterval, not both.
+	Pickup qpkg.Pickup
+	// PollInterval is queue.PollEvery(PollInterval), kept for existing callers.
+	PollInterval      time.Duration
 	ReapInterval      time.Duration
 	VisibilityTimeout time.Duration
 	BatchSizePerQueue int
@@ -337,7 +341,7 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 	if c.WorkerID == "" {
 		c.WorkerID = "workflow-worker"
 	}
-	if c.PollInterval <= 0 {
+	if c.Pickup == (qpkg.Pickup{}) && c.PollInterval <= 0 {
 		c.PollInterval = 100 * time.Millisecond
 	}
 	if c.ReapInterval <= 0 {
@@ -359,7 +363,7 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 }
 
 func (c WorkerConfig) validate() error {
-	if c.PollInterval <= 0 || c.ReapInterval <= 0 || c.VisibilityTimeout <= 0 {
+	if c.ReapInterval <= 0 || c.VisibilityTimeout <= 0 {
 		return ErrInvalidWorkerConfig
 	}
 	if c.BatchSizePerQueue <= 0 || c.BackoffBase <= 0 || c.BackoffMax <= 0 {

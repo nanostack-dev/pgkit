@@ -320,8 +320,8 @@ func NewWorker(module *Module, cfg WorkerConfig) (*Worker, error) {
 	}
 	pqWorker, err := qpkg.NewWorker(module.queue, registry, qpkg.WorkerConfig{
 		WorkerID:          cfg.WorkerID,
+		Pickup:            cfg.Pickup,
 		PollInterval:      cfg.PollInterval,
-		WakeOnEnqueue:     cfg.WakeOnEnqueue,
 		ReapInterval:      cfg.ReapInterval,
 		VisibilityTimeout: cfg.VisibilityTimeout,
 		BatchSizePerQueue: cfg.BatchSizePerQueue,
@@ -336,6 +336,12 @@ func NewWorker(module *Module, cfg WorkerConfig) (*Worker, error) {
 
 func (w *Worker) Run(ctx context.Context) error {
 	return w.worker.Run(ctx)
+}
+
+// Ready is closed once the worker sees every step enqueued from then on; see
+// queue.Worker.Ready.
+func (w *Worker) Ready() <-chan struct{} {
+	return w.worker.Ready()
 }
 
 func (m *Module) executeJob(ctx context.Context, payload jobPayload, job qpkg.Job, cfg WorkerConfig) error {

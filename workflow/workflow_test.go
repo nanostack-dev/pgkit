@@ -278,7 +278,7 @@ func TestWorkflowWorkerExecutesDependentSteps(t *testing.T) {
 	}
 }
 
-func TestWorkflowWorkerWakeOnEnqueueRunsDependentStepsWithoutPolling(t *testing.T) {
+func TestWorkflowWorkerOnEnqueueRunsAStartedRunWithoutRescanning(t *testing.T) {
 	ctx := context.Background()
 	db := createWorkflowTestDB(t, ctx)
 	queue := createWorkflowQueue(t, ctx, db)
@@ -326,13 +326,22 @@ func TestWorkflowWorkerWakeOnEnqueueRunsDependentStepsWithoutPolling(t *testing.
 		t.Fatalf("activate: %v", err)
 	}
 
-	worker, err := NewWorker(module, WorkerConfig{PollInterval: time.Hour, WakeOnEnqueue: true, ReapInterval: time.Hour, BatchSizePerQueue: 10})
+	worker, err := NewWorker(module, WorkerConfig{
+		Pickup:            qpkg.OnEnqueue().RescanEvery(time.Hour),
+		ReapInterval:      time.Hour,
+		BatchSizePerQueue: 10,
+	})
 	if err != nil {
 		t.Fatalf("new worker: %v", err)
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { _ = worker.Run(workerCtx) }()
+	select {
+	case <-worker.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker never became ready")
+	}
 
 	run, err := module.Start(ctx, "dependent_wake", map[string]any{"name": "rowan"}, nil)
 	if err != nil {

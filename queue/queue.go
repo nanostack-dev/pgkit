@@ -30,10 +30,6 @@ var (
 // Types
 // ---------------------------------------------------------------------------
 
-// NotifyChannel carries the queue name of every job that becomes claimable now:
-// enqueued, replayed or requeued by the reaper. Delivery happens at commit.
-const NotifyChannel = "pgqueue_jobs"
-
 // JobStatus represents the lifecycle state of a job.
 type JobStatus string
 
@@ -163,9 +159,10 @@ func (noopLogger) Error(context.Context, string, map[string]any) {}
 
 // Client is the main pgqueue client.
 type Client struct {
-	db    *sql.DB
-	hooks []Hook
-	log   Logger
+	db       *sql.DB
+	hooks    []Hook
+	log      Logger
+	notifier *notifier
 }
 
 // New creates a new pgqueue Client.
@@ -173,7 +170,9 @@ func New(db *sql.DB, hooks ...Hook) (*Client, error) {
 	if db == nil {
 		return nil, ErrNilDB
 	}
-	return &Client{db: db, hooks: hooks, log: noopLogger{}}, nil
+	c := &Client{db: db, hooks: hooks, log: noopLogger{}}
+	c.notifier = newNotifier(c)
+	return c, nil
 }
 
 // DB returns the underlying *sql.DB for advanced use (e.g. EnqueueTx).
@@ -235,6 +234,19 @@ func (c *Client) logError(ctx context.Context, msg string, fields map[string]any
 	if c != nil && c.log != nil {
 		c.log.Error(ctx, msg, fields)
 	}
+}
+
+// logFailure logs a failure from a background loop (poll, reap, listen). A
+// connectivity or lifecycle failure (database unreachable, shutting down, or torn
+// down) is transient — the loop retries — so it logs at warn to avoid false-positive
+// error alerts on events an operator cannot act on; every other failure stays at
+// error. Message and fields are identical either way.
+func (c *Client) logFailure(ctx context.Context, msg string, fields map[string]any, err error) {
+	if isConnectivityError(err) {
+		c.logWarn(ctx, msg, fields)
+		return
+	}
+	c.logError(ctx, msg, fields)
 }
 
 func (c *Client) emit(ctx context.Context, kind EventKind, meta map[string]any) {
@@ -376,7 +388,7 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 				VALUES ($1, $2, 'pending', 0, $3, NOW())
 				RETURNING id, queue_name
 			 )
-			 SELECT job.id FROM job, pg_notify('`+NotifyChannel+`', job.queue_name)`,
+			 SELECT job.id FROM job, `+notifySQL("job"),
 			p.QueueName, p.Payload, p.MaxAttempts,
 		).Scan(&id)
 	} else {
@@ -386,7 +398,7 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 				VALUES ($1, $2, 'pending', 0, $3, $4)
 				RETURNING id, queue_name
 			 )
-			 SELECT job.id FROM job, pg_notify('`+NotifyChannel+`', job.queue_name)`,
+			 SELECT job.id FROM job, `+notifySQL("job"),
 			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(),
 		).Scan(&id)
 	}
@@ -656,7 +668,7 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 			  AND attempts < max_attempts
 			RETURNING queue_name
 		 )
-		 SELECT 1 FROM requeued, pg_notify('`+NotifyChannel+`', requeued.queue_name)`,
+		 SELECT 1 FROM requeued, `+notifySQL("requeued"),
 		fmt.Sprintf("%d seconds", int(visibilityTimeout.Seconds())),
 	)
 	if err != nil {
@@ -875,7 +887,7 @@ func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 			  AND status IN ('done', 'failed')
 			RETURNING queue_name
 		 )
-		 SELECT 1 FROM replayed, pg_notify('`+NotifyChannel+`', replayed.queue_name)`,
+		 SELECT 1 FROM replayed, `+notifySQL("replayed"),
 		id,
 	)
 	if err != nil {
