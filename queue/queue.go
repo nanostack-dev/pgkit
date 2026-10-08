@@ -159,9 +159,10 @@ func (noopLogger) Error(context.Context, string, map[string]any) {}
 
 // Client is the main pgqueue client.
 type Client struct {
-	db    *sql.DB
-	hooks []Hook
-	log   Logger
+	db       *sql.DB
+	hooks    []Hook
+	log      Logger
+	notifier *notifier
 }
 
 // New creates a new pgqueue Client.
@@ -169,7 +170,9 @@ func New(db *sql.DB, hooks ...Hook) (*Client, error) {
 	if db == nil {
 		return nil, ErrNilDB
 	}
-	return &Client{db: db, hooks: hooks, log: noopLogger{}}, nil
+	c := &Client{db: db, hooks: hooks, log: noopLogger{}}
+	c.notifier = newNotifier(c)
+	return c, nil
 }
 
 // DB returns the underlying *sql.DB for advanced use (e.g. EnqueueTx).
@@ -231,6 +234,19 @@ func (c *Client) logError(ctx context.Context, msg string, fields map[string]any
 	if c != nil && c.log != nil {
 		c.log.Error(ctx, msg, fields)
 	}
+}
+
+// logFailure logs a failure from a background loop (poll, reap, listen). A
+// connectivity or lifecycle failure (database unreachable, shutting down, or torn
+// down) is transient — the loop retries — so it logs at warn to avoid false-positive
+// error alerts on events an operator cannot act on; every other failure stays at
+// error. Message and fields are identical either way.
+func (c *Client) logFailure(ctx context.Context, msg string, fields map[string]any, err error) {
+	if isConnectivityError(err) {
+		c.logWarn(ctx, msg, fields)
+		return
+	}
+	c.logError(ctx, msg, fields)
 }
 
 func (c *Client) emit(ctx context.Context, kind EventKind, meta map[string]any) {
@@ -367,16 +383,22 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 	if p.AvailableAt == nil {
 		// P0 #4: Use DB NOW() for immediate jobs to avoid clock skew.
 		err = qe.QueryRowContext(ctx,
-			`INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-			 VALUES ($1, $2, 'pending', 0, $3, NOW())
-			 RETURNING id`,
+			`WITH job AS (
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
+				VALUES ($1, $2, 'pending', 0, $3, NOW())
+				RETURNING id, queue_name
+			 )
+			 SELECT job.id FROM job, `+notifySQL("job"),
 			p.QueueName, p.Payload, p.MaxAttempts,
 		).Scan(&id)
 	} else {
 		err = qe.QueryRowContext(ctx,
-			`INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-			 VALUES ($1, $2, 'pending', 0, $3, $4)
-			 RETURNING id`,
+			`WITH job AS (
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
+				VALUES ($1, $2, 'pending', 0, $3, $4)
+				RETURNING id, queue_name
+			 )
+			 SELECT job.id FROM job, `+notifySQL("job"),
 			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(),
 		).Scan(&id)
 	}
@@ -634,15 +656,19 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 
 	// Requeue: processing + stale + attempts < max_attempts -> pending
 	resRequeue, err := c.db.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-		 SET status = 'pending',
-		     claimed_by = NULL,
-		     claimed_at = NULL,
-		     available_at = NOW(),
-		     updated_at = NOW()
-		 WHERE status = 'processing'
-		   AND claimed_at < NOW() - $1::interval
-		   AND attempts < max_attempts`,
+		`WITH requeued AS (
+			UPDATE pgqueue_jobs
+			SET status = 'pending',
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    available_at = NOW(),
+			    updated_at = NOW()
+			WHERE status = 'processing'
+			  AND claimed_at < NOW() - $1::interval
+			  AND attempts < max_attempts
+			RETURNING queue_name
+		 )
+		 SELECT 1 FROM requeued, `+notifySQL("requeued"),
 		fmt.Sprintf("%d seconds", int(visibilityTimeout.Seconds())),
 	)
 	if err != nil {
@@ -847,17 +873,21 @@ func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	}
 
 	res, err := exec.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-         SET status = 'pending',
-             attempts = 0,
-             available_at = NOW(),
-             claimed_by = NULL,
-             claimed_at = NULL,
-             done_at = NULL,
-             last_error = NULL,
-             updated_at = NOW()
-         WHERE id = $1
-           AND status IN ('done', 'failed')`,
+		`WITH replayed AS (
+			UPDATE pgqueue_jobs
+			SET status = 'pending',
+			    attempts = 0,
+			    available_at = NOW(),
+			    claimed_by = NULL,
+			    claimed_at = NULL,
+			    done_at = NULL,
+			    last_error = NULL,
+			    updated_at = NOW()
+			WHERE id = $1
+			  AND status IN ('done', 'failed')
+			RETURNING queue_name
+		 )
+		 SELECT 1 FROM replayed, `+notifySQL("replayed"),
 		id,
 	)
 	if err != nil {

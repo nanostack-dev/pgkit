@@ -56,6 +56,56 @@ not registered in PostgreSQL: all callers using a queue name must agree on a
 compatible JSON shape, including old producers during rolling deployments.
 Raw enqueue and `RegisterJSON`/`RegisterJSONTyped` remain supported.
 
+### Picking up jobs
+
+Build a worker for one or more typed queues; `Pickup` decides when it looks for
+jobs:
+
+```go
+worker, err := client.Worker("notifications").
+    Pickup(queue.OnEnqueue()). // claim at commit, rescan every 5s
+    Handle(emails, sendEmail).
+    Handle(receipts, sendReceipt).
+    Tune(queue.WorkerConfig{VisibilityTimeout: time.Minute}).
+    Build()
+
+queue.OnEnqueue().RescanEvery(30 * time.Second)
+queue.PollEvery(250 * time.Millisecond) // scan only, no LISTEN
+```
+
+`Handle` is generic over the queue's payload type; `HandleRaw` takes a queue name
+and an undecoded `Handler`. Builder methods return copies, so a shared base can
+be extended without affecting other workers. `NewWorker` with a `HandlerRegistry`
+and `WorkerConfig.Pickup` remains available.
+
+With `OnEnqueue`, enqueue, replay and the reaper send a `pg_notify` on
+`queue.NotifyChannel`, delivered when their transaction commits. Every worker of
+every replica listening for that queue wakes; `FOR UPDATE SKIP LOCKED` splits the
+jobs between them. Identical notifications in one transaction collapse into one,
+and a worker coalesces notifications that arrive while it is busy into a single
+extra scan. A batch that fills up is followed by another scan straight away.
+
+Notifications are hints, so the worker still rescans: delayed jobs and retries
+are picked up within one rescan interval of falling due, and the listener scans
+once each time it (re)connects to recover anything sent while it was down. All
+workers of a `Client` share one `LISTEN` connection, opened outside the `*sql.DB`
+pool. With the pgx stdlib driver it is configured like the pool's connections.
+With any other driver (lib/pq, instrumentation wrappers), give it a connection
+before building workers, or `Build` returns `ErrNotificationsUnsupported`:
+
+```go
+err := client.ListenOn(postgresConfig.DSN())            // URL or key=value DSN
+client.ListenWith(func(ctx context.Context) (*pgx.Conn, error) {
+    return pgx.ConnectConfig(ctx, freshConfigWithRotatedPassword())
+})
+```
+
+`Worker.Ready()` closes after the first scan in which every claim succeeded with
+the listener up; from then on a newly claimable job wakes the worker.
+
+`PollInterval` still works and means `PollEvery(PollInterval)`; set it or
+`Pickup`, not both.
+
 ## Admin UI Dashboard
 
 The dashboard is fully embedded (SvelteKit static build + JSON API) and protected with Basic Auth.
