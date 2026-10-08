@@ -117,7 +117,7 @@ func (j *Job) runLocked(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("acquire schedule lock: %w", err)
 	}
 	if !acquired {
-		return Result{Outcome: Busy}, nil
+		return commitIdle(tx, Result{Outcome: Busy})
 	}
 	// A new job is due immediately (the column defaults to now()). Preserve an
 	// existing job's due time across restarts and calls from other replicas.
@@ -135,10 +135,10 @@ func (j *Job) runLocked(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("read schedule: %w", err)
 	}
 	if nextRun.After(databaseNow) {
-		return Result{
+		return commitIdle(tx, Result{
 			Outcome: NotDue, NextRunAt: nextRun,
 			wakeAt: time.Now().Add(nextRun.Sub(databaseNow)),
-		}, nil
+		})
 	}
 	if err := j.params.Run(ctx, tx); err != nil {
 		return Result{}, fmt.Errorf("run: %w", err)
@@ -164,4 +164,13 @@ RETURNING next_run_at, clock_timestamp()`
 		return Result{}, fmt.Errorf("commit schedule: %w", err)
 	}
 	return Result{Outcome: Ran, NextRunAt: nextRun, wakeAt: wakeAt}, nil
+}
+
+// commitIdle ends a pass that changed nothing. Committing instead of rolling back
+// keeps pg_stat_database.xact_rollback a failure signal rather than a poll counter.
+func commitIdle(tx *sql.Tx, result Result) (Result, error) {
+	if err := tx.Commit(); err != nil {
+		return Result{}, fmt.Errorf("commit idle pass: %w", err)
+	}
+	return result, nil
 }
