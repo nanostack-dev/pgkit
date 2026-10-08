@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/nanostack-dev/pgkit/pgcron"
+	"github.com/nanostack-dev/pgkit/pglock"
 	"github.com/nanostack-dev/pgkit/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -330,7 +331,55 @@ func TestPostgresScheduling(t *testing.T) {
 	})
 }
 
+func TestIdlePassesCommitInsteadOfRollingBack(t *testing.T) {
+	ctx := t.Context()
+	dsn := testDSN(t)
+	stats := openDB(t, dsn)
+	_, err := stats.ExecContext(ctx, pgcron.Schema)
+	require.NoError(t, err)
+	jobDB := openDB(t, dsn)
+	jobDB.SetMaxOpenConns(1)
+	job, err := pgcron.Named(jobDB, t.Name()).Every(time.Hour).
+		DoTx(func(context.Context, *sql.Tx) error { return nil })
+	require.NoError(t, err)
+	first, err := job.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, pgcron.Ran, first.Outcome)
+	rollbacks := func() (count int64) {
+		_, err := jobDB.ExecContext(ctx, "SELECT pg_stat_force_next_flush()")
+		require.NoError(t, err)
+		require.NoError(t, stats.QueryRowContext(ctx,
+			"SELECT xact_rollback FROM pg_stat_database WHERE datname = current_database()").Scan(&count))
+		return count
+	}
+	before := rollbacks()
+
+	holder, err := stats.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	acquired, err := pglock.TryAdvisoryXactLock(ctx, holder, t.Name())
+	require.NoError(t, err)
+	require.True(t, acquired)
+	busy, err := job.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, pgcron.Busy, busy.Outcome)
+	require.NoError(t, holder.Commit())
+
+	notDue, err := job.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, pgcron.NotDue, notDue.Outcome)
+
+	assert.Equal(t, before, rollbacks())
+}
+
 func testDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db := openDB(t, testDSN(t))
+	_, err := db.ExecContext(t.Context(), pgcron.Schema)
+	require.NoError(t, err)
+	return db
+}
+
+func testDSN(t *testing.T) string {
 	t.Helper()
 	ctx := t.Context()
 	container, err := postgres.Run(ctx, "postgres:16-alpine",
@@ -340,10 +389,13 @@ func testDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
+	return dsn
+}
+
+func openDB(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.ExecContext(ctx, pgcron.Schema)
-	require.NoError(t, err)
 	return db
 }
