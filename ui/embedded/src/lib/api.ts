@@ -3,7 +3,8 @@ import type {
 	QueueJobsResponse,
 	QueueLock,
 	QueueSummary,
-	WorkflowRunGraphView,
+	WorkflowRun,
+	WorkflowRunDetail,
 	WorkflowRunsResponse
 } from './types';
 
@@ -83,7 +84,7 @@ export function getQueueLocks(): Promise<QueueLock[]> {
 }
 
 export function getWorkflowRuns(filters: {
-	workflow_name?: string;
+	workflow?: string;
 	status?: string;
 	search?: string;
 	limit?: number;
@@ -92,18 +93,18 @@ export function getWorkflowRuns(filters: {
 	return getJSON<WorkflowRunsResponse>(`/api/dashboard/workflow/runs${queryString(filters)}`);
 }
 
-export function getWorkflowRun(runID: string): Promise<WorkflowRunGraphView> {
-	return getJSON<WorkflowRunGraphView>(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}`);
+export function getWorkflowRun(runID: string): Promise<WorkflowRunDetail> {
+	return getJSON<WorkflowRunDetail>(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}`);
 }
 
 export function replayQueueJob(jobID: number): Promise<void> {
 	return mutateJSON<unknown>(`/api/dashboard/queue/jobs/${jobID}/replay`).then(() => undefined);
 }
 
-export function retryWorkflowRun(runID: string) {
-	return mutateJSON(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}/retry`);
+export function retryWorkflowRun(runID: string): Promise<WorkflowRun> {
+	return mutateJSON<WorkflowRun>(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}/retry`);
 }
 
-export function retryWorkflowStep(stepID: number) {
-	return mutateJSON(`/api/dashboard/workflow/steps/${stepID}/retry`);
+export function cancelWorkflowRun(runID: string): Promise<WorkflowRun> {
+	return mutateJSON<WorkflowRun>(`/api/dashboard/workflow/runs/${encodeURIComponent(runID)}/cancel`);
 }

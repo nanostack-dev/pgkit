@@ -13,7 +13,7 @@ type Params struct {
 	fx.In
 
 	Queue    *qpkg.Client
-	Workflow *workflow.Module `optional:"true"`
+	Workflow *workflow.Client `optional:"true"`
 }
 
 type Options struct {

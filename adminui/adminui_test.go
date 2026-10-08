@@ -20,6 +20,116 @@ import (
 func TestAdminUISnapshotAndWorkflowRun(t *testing.T) {
 	ctx := context.Background()
 	db := createTestDB(t, ctx)
+	queue, workflows := newClients(t, ctx, db)
+	child := workflow.Define("adminui-child", func(wf *workflow.Context, n int) (int, error) {
+		return wf.Step("double", func(context.Context) (int, error) { return n * 2, nil })
+	})
+	parent := workflow.Define("adminui-demo", func(wf *workflow.Context, n int) (int, error) {
+		doubled, err := wf.Call("child", child, n)
+		if err != nil {
+			return 0, err
+		}
+		return wf.Step("finalize", func(context.Context) (int, error) { return doubled + 1, nil })
+	})
+	runWorker(t, ctx, workflows, parent, child)
+	if _, err := queue.Enqueue(ctx, qpkg.EnqueueParams{QueueName: "adminui.audit", Payload: []byte(`{"event":"boot"}`), MaxAttempts: 3}); err != nil {
+		t.Fatalf("enqueue queue job: %v", err)
+	}
+	run, err := workflows.Start(ctx, parent, 20, workflow.Key("adminui-run"))
+	if err != nil {
+		t.Fatalf("start workflow run: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if _, err := run.Result(waitCtx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	server := newServer(t, queue, Options{Token: "secret", Workflow: workflows})
+
+	var snapshot snapshotResponse
+	getJSON(t, server.URL+"/api/dashboard/snapshot", http.StatusOK, &snapshot)
+	if snapshot.Queue.Summary.TotalJobs == 0 || snapshot.Workflow.Runs.Total != 2 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+
+	var detail workflowRunDetail
+	getJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID, http.StatusOK, &detail)
+	if detail.Run.ID != run.ID || detail.Run.Status != "succeeded" || *detail.Run.Key != "adminui-run" || *detail.Run.Output != "41" {
+		t.Fatalf("run = %+v", detail.Run)
+	}
+	if len(detail.Steps) != 2 || detail.Steps[0].Name != "child" || detail.Steps[0].Kind != "child" || detail.Steps[1].Name != "finalize" {
+		t.Fatalf("steps = %+v", detail.Steps)
+	}
+	if len(detail.Children) != 1 || detail.Children[0].Workflow != "adminui-child" || *detail.Children[0].ParentRunID != run.ID {
+		t.Fatalf("children = %+v", detail.Children)
+	}
+
+	var children listResponse[workflowRun]
+	getJSON(t, server.URL+"/api/dashboard/workflow/runs?parent_run_id="+run.ID, http.StatusOK, &children)
+	if children.Total != 1 {
+		t.Fatalf("children = %+v", children)
+	}
+	getJSON(t, server.URL+"/api/dashboard/workflow/runs/missing", http.StatusNotFound, nil)
+}
+
+func TestAdminUICancelsAndRetriesWorkflowRuns(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+	queue, workflows := newClients(t, ctx, db)
+	approved := workflow.NewSignal[string]("approved")
+	flow := workflow.Define("adminui-approval", func(wf *workflow.Context, _ struct{}) (string, error) {
+		return wf.Receive(approved, workflow.Forever)
+	})
+	runWorker(t, ctx, workflows, flow)
+	run, err := workflows.Start(ctx, flow, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireEventually(t, 10*time.Second, 20*time.Millisecond, func() bool {
+		info, err := workflows.GetRun(ctx, run.ID)
+		return err == nil && info.Status == workflow.RunWaiting
+	})
+	server := newServer(t, queue, Options{Token: "secret", Workflow: workflows})
+
+	var cancelled workflowRun
+	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/cancel", http.StatusOK, &cancelled)
+	if cancelled.Status != "cancelled" {
+		t.Fatalf("run = %+v", cancelled)
+	}
+	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/cancel", http.StatusOK, nil)
+
+	var retried workflowRun
+	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/retry", http.StatusOK, &retried)
+	if retried.Status != "pending" {
+		t.Fatalf("run = %+v", retried)
+	}
+	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/retry", http.StatusConflict, nil)
+	postJSON(t, server.URL+"/api/dashboard/workflow/runs/missing/cancel", http.StatusNotFound, nil)
+
+	if err := workflows.Signal(ctx, run.ID, approved, "yes"); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if got, err := run.Result(waitCtx); err != nil || got != "yes" {
+		t.Fatalf("result = %q, err = %v", got, err)
+	}
+}
+
+func TestAdminUIWithoutMutationsHasNoWorkflowActions(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+	queue, workflows := newClients(t, ctx, db)
+	disabled := false
+	server := newServer(t, queue, Options{Token: "secret", Workflow: workflows, EnableMutations: &disabled})
+
+	for _, action := range []string{"cancel", "retry"} {
+		postJSON(t, server.URL+"/api/dashboard/workflow/runs/any/"+action, http.StatusMethodNotAllowed, nil)
+	}
+}
+
+func newClients(t *testing.T, ctx context.Context, db *sql.DB) (*qpkg.Client, *workflow.Client) {
+	t.Helper()
 	queue, err := qpkg.New(db)
 	if err != nil {
 		t.Fatalf("new queue: %v", err)
@@ -27,113 +137,76 @@ func TestAdminUISnapshotAndWorkflowRun(t *testing.T) {
 	if err := queue.EnsureSchema(ctx); err != nil {
 		t.Fatalf("ensure queue schema: %v", err)
 	}
-	def, err := workflow.Define("adminui-demo", func(b *workflow.Builder) {
-		b.ForEach("fanout", func(_ context.Context, _ workflow.StepContext) ([]any, error) {
-			return []any{
-				map[string]any{"value": 1},
-				map[string]any{"value": 2},
-				map[string]any{"value": 3},
-			}, nil
-		}, func(_ context.Context, step workflow.StepContext) (any, error) {
-			var input struct {
-				Value int `json:"value"`
-			}
-			if err := step.DecodeInput(&input); err != nil {
-				return nil, err
-			}
-			return map[string]any{"processed": input.Value * 2}, nil
-		}, workflow.StepOptions{})
-		b.Step("finalize", func(_ context.Context, step workflow.StepContext) (any, error) {
-			return map[string]any{"count": len(step.ItemOutputs("fanout"))}, nil
-		}, workflow.StepOptions{DependsOn: []string{"fanout"}})
-	})
+	workflows, err := workflow.New(queue)
 	if err != nil {
-		t.Fatalf("define workflow: %v", err)
+		t.Fatalf("new workflow client: %v", err)
 	}
-	module, err := workflow.New(db, queue, def)
-	if err != nil {
-		t.Fatalf("new workflow module: %v", err)
-	}
-	if err := module.EnsureSchema(ctx); err != nil {
+	if err := workflows.EnsureSchema(ctx); err != nil {
 		t.Fatalf("ensure workflow schema: %v", err)
 	}
-	if _, err := module.Publish(ctx, "adminui-demo"); err != nil {
-		t.Fatalf("publish workflow: %v", err)
-	}
-	if err := module.Activate(ctx, "adminui-demo", 1); err != nil {
-		t.Fatalf("activate workflow: %v", err)
-	}
-	worker, err := workflow.NewWorker(module, workflow.WorkerConfig{PollInterval: 20 * time.Millisecond, ReapInterval: time.Second})
+	return queue, workflows
+}
+
+func runWorker(t *testing.T, ctx context.Context, workflows *workflow.Client, definitions ...workflow.Definition) {
+	t.Helper()
+	worker, err := workflows.Worker("adminui-test").Workflows(definitions...).Pickup(qpkg.OnEnqueue().RescanEvery(100 * time.Millisecond)).Build()
 	if err != nil {
-		t.Fatalf("new workflow worker: %v", err)
+		t.Fatalf("build worker: %v", err)
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() { _ = worker.Run(workerCtx) }()
-	if _, err := queue.Enqueue(ctx, qpkg.EnqueueParams{QueueName: "adminui.audit", Payload: []byte(`{"event":"boot"}`), MaxAttempts: 3}); err != nil {
-		t.Fatalf("enqueue queue job: %v", err)
-	}
-	run, err := module.Start(ctx, "adminui-demo", nil, &workflow.StartRunOptions{CreatedBy: "tester", CorrelationKey: "adminui-run"})
-	if err != nil {
-		t.Fatalf("start workflow run: %v", err)
-	}
-	requireEventually(t, 8*time.Second, 50*time.Millisecond, func() bool {
-		view, err := module.GetRunGraphView(ctx, run.ID)
-		return err == nil && view.Run.Status == workflow.RunStatusSucceeded
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = worker.Run(workerCtx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
 	})
-	ui, err := New(queue, Options{Token: "secret", Workflow: module})
+	<-worker.Ready()
+}
+
+func newServer(t *testing.T, queue *qpkg.Client, options Options) *httptest.Server {
+	t.Helper()
+	ui, err := New(queue, options)
 	if err != nil {
 		t.Fatalf("new admin ui: %v", err)
 	}
 	server := httptest.NewServer(ui.Handler())
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return server
+}
 
-	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/dashboard/snapshot", nil)
+func getJSON(t *testing.T, url string, wantStatus int, target any) {
+	t.Helper()
+	request(t, http.MethodGet, url, wantStatus, target)
+}
+
+func postJSON(t *testing.T, url string, wantStatus int, target any) {
+	t.Helper()
+	request(t, http.MethodPost, url, wantStatus, target)
+}
+
+func request(t *testing.T, method, url string, wantStatus int, target any) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
-		t.Fatalf("new snapshot request: %v", err)
+		t.Fatal(err)
 	}
 	req.SetBasicAuth("admin", "secret")
+	req.Header.Set("X-Requested-With", "pgkit-admin-ui")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("get snapshot: %v", err)
+		t.Fatalf("%s %s: %v", method, url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 snapshot, got %d", resp.StatusCode)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("%s %s: status %d, want %d", method, url, resp.StatusCode, wantStatus)
 	}
-	var snapshot snapshotResponse
-	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
-		t.Fatalf("decode snapshot: %v", err)
-	}
-	if snapshot.Queue.Summary.TotalJobs == 0 {
-		t.Fatal("expected queue jobs in snapshot")
-	}
-	if snapshot.Workflow.Runs.Total == 0 {
-		t.Fatal("expected workflow runs in snapshot")
-	}
-
-	req, err = http.NewRequest(http.MethodGet, server.URL+"/api/dashboard/workflow/runs/"+run.ID, nil)
-	if err != nil {
-		t.Fatalf("new workflow detail request: %v", err)
-	}
-	req.SetBasicAuth("admin", "secret")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("get workflow detail: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 workflow detail, got %d", resp.StatusCode)
-	}
-	var graphView workflow.RunGraphView
-	if err := json.NewDecoder(resp.Body).Decode(&graphView); err != nil {
-		t.Fatalf("decode workflow detail: %v", err)
-	}
-	if graphView.Run.ID != run.ID {
-		t.Fatalf("expected run id %s, got %s", run.ID, graphView.Run.ID)
-	}
-	if len(graphView.Nodes) == 0 {
-		t.Fatal("expected workflow graph nodes")
+	if target != nil {
+		if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+			t.Fatalf("decode %s: %v", url, err)
+		}
 	}
 }
 
