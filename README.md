@@ -2,7 +2,7 @@
 
 PostgreSQL primitives for distributed systems in Go.
 
-Requires Go 1.27 or newer (typed queue handles use generic methods).
+Requires Go 1.27 or newer (typed queue handles and workflow operations use generic methods).
 
 Standalone contributor setup, architecture, tests and release procedures: [docs/README.md](docs/README.md). Agent rules: [AGENTS.md](AGENTS.md); canonical vocabulary: [CONTEXT.md](CONTEXT.md).
 
@@ -17,7 +17,7 @@ go get github.com/nanostack-dev/pgkit
 - `pglock`: advisory lock helpers (`transaction` and `session` scoped)
 - `pgcron`: durable interval schedules shared across replicas ([docs](pgcron/README.md))
 - `queue`: durable queue with claim/ack/retry/fail/reap
-- `workflow`: durable temporal-style workflows built on top of `queue` ([docs](workflow/README.md))
+- `workflow`: durable Go functions with typed, checkpointed steps, sleeps, signals and child runs, built on `queue` ([docs](workflow/README.md))
 - `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
 - `fx`: Uber Fx modules for locks, queues, workflows, and the dashboard
 
@@ -108,6 +108,32 @@ the listener up; from then on a newly claimable job wakes the worker.
 `PollInterval` still works and means `PollEvery(PollInterval)`; set it or
 `Pickup`, not both.
 
+A worker reaps stuck jobs of its own queues only, with its `VisibilityTimeout`;
+`client.Reap(ctx, queue.ReapParams{...})` does the same for chosen queues and
+`ReapStuckJobs` for all of them. Workers claim and settle jobs on contexts that
+shutdown does not cancel: a handler finishing while its worker stops still settles
+its job, and a job claimed as the worker stops is handed back at once.
+
+### Long-running and parked jobs
+
+These primitives let a handler keep, park or hand back the job it holds. The
+workflow package is built on them.
+
+```go
+err := client.Heartbeat(ctx, job)                  // extend the claim; ErrJobNotFound once it is lost
+err = client.SnoozeTx(ctx, tx, job, until)         // back to pending at until, attempt refunded
+err = client.SnoozeTx(ctx, tx, job, time.Time{})   // parked until woken (available at queue.ParkedUntil)
+err = client.WakeTx(ctx, tx, jobID)                // a parked or delayed job becomes due now, workers notified
+```
+
+`Heartbeat` and `SnoozeTx` act only on the claim described by `job` (its ID and
+attempt number), so a handler whose job was reaped and claimed elsewhere cannot
+touch the new claim. Durations and timeouts keep sub-second precision.
+
+`client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
+`LISTEN` connection for other keys: a subscription wakes when a notification for
+one of its keys commits, and when the listener reconnects.
+
 ## Admin UI Dashboard
 
 The dashboard is fully embedded (SvelteKit static build + JSON API) and protected with Basic Auth.
@@ -122,19 +148,21 @@ Optional env vars:
 
 ## Running the Playground
 
-The easiest way to test out the full pgkit suite (Queue, Workflows, Admin UI) is to run the playground.
-It uses testcontainers to automatically spin up a local PostgreSQL instance, applies all schemas, runs sample background tasks, and starts the Admin UI server.
+The easiest way to try pgkit (queue, workflows, admin UI) is the playground. It
+starts PostgreSQL with testcontainers, applies the schemas, runs order-fulfilment
+workflows that succeed, retry, wait for approval, fail and get cancelled, and serves
+the admin UI.
 
 ```bash
-cd pgkit
 PGKIT_DASHBOARD_TOKEN="change-me" go run ./cmd/pgkit-playground
 ```
 
-Open `http://localhost:8080` and authenticate with any username + `PGKIT_DASHBOARD_TOKEN` as password.
+Open `http://127.0.0.1:18081` (or `PGKIT_PLAYGROUND_ADDR`) and authenticate with any
+username and `PGKIT_DASHBOARD_TOKEN` as password.
 
 ## Custom logger adapter
 
-`pglock.Client`, `queue.Client`, and `workflow.Module` all support custom logging adapters:
+`pglock.Client`, `queue.Client`, and `workflow.Client` all support custom logging adapters:
 
 ```go
 type Logger interface {

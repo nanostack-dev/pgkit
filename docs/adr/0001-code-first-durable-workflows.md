@@ -1,81 +1,65 @@
 # 0001: Code-first durable workflows
 
-Status: accepted (2026-10-08), implementation in progress on `feat/workflow-v2`.
+Status: accepted (2026-10-08)
+
+## Context
+
+The `workflow` package ran DAG definitions: steps declared with `DependsOn`, published
+and activated as versioned graphs, exchanging untyped JSON (`any`,
+`StepContext.Output(name, &target)`). It had no durable sleep, no way to wait for an
+external event, no idempotent start, no cancellation or deadlines, and no loops or
+conditional branches. Its only consumer, Echopoint's two-step OpenAPI sync, also had
+to publish, list and activate definitions by hand at startup.
+
+Go 1.27 allows generic methods on concrete types, which makes a fully typed API
+possible without code generation.
+
+Research covered DBOS Transact Go, Absurd, pgflow, Hatchet, River Pro, Temporal,
+go-workflows, Restate, Inngest, Cloudflare Workflows and Vercel's Workflow DevKit, and
+essays on determinism, idempotency keys and fencing (Vanlightly, Ronacher, Brandur,
+Kleppmann).
 
 ## Decision
 
-Replace the DAG package (`Define/Builder/Publish/Activate`, graph diff) with durable Go functions
-whose steps are checkpointed in PostgreSQL by name. Breaking change approved by the owner;
-echopoint's openapi-sync is migrated in a companion PR. New tables use the `pgworkflow_` prefix,
-so the old `workflow_*` tables stay untouched (apps drop them after draining).
+Replace the DAG package with durable Go functions:
 
-Research basis: DBOS Go, Absurd, pgflow, Hatchet, River, Temporal, go-workflows, Restate, Inngest,
-Cloudflare Workflows, Vanlightly's determinism essays, Brandur's idempotency/job-drain posts.
+- A workflow is `workflow.Define(name, func(*workflow.Context, In) (Out, error))`. Durable
+  operations are generic methods on the context: `Step`, `TxStep`, `Async`, `Sleep`,
+  `SleepUntil`, `Receive` (typed signals) and child runs through `Start`/`Call`.
+- Operations are checkpointed by name; repeated names are numbered (`name#2`). Each
+  activation re-executes the function from the top and completed checkpoints return
+  their recorded result. A checkpoint recorded under another kind, or a value that no
+  longer decodes, fails the run with `ErrNonDeterministic`.
+- Each run owns one queue job. A waiting run snoozes it; senders wake it. Activations
+  bump a lease that fences every checkpoint write.
+- `TxStep` commits user writes with the checkpoint, and `StartTx`/`SignalTx` join the
+  caller's transaction: the PostgreSQL-only guarantees other engines lack.
+- New `pgworkflow_*` tables; the old `workflow_*` tables are not migrated.
 
-## API (Go 1.27 generic methods)
+The breaking change was approved by the repository owner, with Echopoint migrated in a
+companion change.
 
-```go
-var Approved = workflow.NewSignal[Approval]("approved")
+## Alternatives
 
-var Onboard = workflow.Define("onboard", func(wf *workflow.Context, in Signup) (Account, error) {
-    user, err := wf.Step("create-user", createUser, workflow.Retry{MaxAttempts: 5}, workflow.Timeout(30*time.Second))
-    acct, err := wf.TxStep("open-account", openAccount)       // checkpoint commits with the tx: exactly once
-    approval, err := wf.Receive(Approved, 72*time.Hour)       // errors.Is(err, workflow.ErrTimeout); workflow.Forever
-    err = wf.Sleep("cool-off", 24*time.Hour)                  // also SleepUntil
-    profile := wf.Async("fetch-profile", fetchProfile)        // in-process parallel step -> *Future[T]
-    child := wf.Start("provision", Provision, req)            // child run -> *Future[Out]; wf.Call = Start+Wait
-    p, err := profile.Wait()
-    return acct, err
-}, workflow.Version(2), workflow.Retry{MaxAttempts: 3})
+- **Typed DAG:** keep declared graphs and type the edges with generic refs. It keeps the
+  graph view and version diffs, but sleeps, signals, loops and branches would each need
+  graph constructs, and joins of differently typed parents need `Join2`/`Join3`.
+- **Both models side by side:** nothing breaks, but the package would carry two runtimes,
+  two schemas and two admin views.
+- **Full-history replay (Temporal style):** detects any divergence but makes every change
+  to in-flight code a versioning problem and requires strict determinism. Checkpoints by
+  name tolerate added steps and keep the determinism burden to two rules.
+- **Positional checkpoints (DBOS style):** reorderings break in-flight runs; names are
+  more forgiving and readable in the admin UI.
 
-client, err := workflow.New(queueClient)                      // DB from queueClient.DB()
-run, err := client.Start(ctx, Onboard, in, workflow.Key("onboard:"+email), workflow.Timeout(time.Hour))
-run, err := client.StartTx(ctx, tx, Onboard, in)
-err = client.Signal(ctx, run.ID, Approved, Approval{By: "lea"}) // also SignalTx
-acct, err := run.Result(ctx)                                    // *RunError, ErrCancelled
-client.Run(Onboard, id); client.RunByKey(ctx, Onboard, key)
-client.Cancel / Retry (resume from failure) / GetRun / Steps / ListRuns / Purge
-worker, err := client.Worker("onboarding").Workflows(Onboard, Provision).Pickup(queue.OnEnqueue()).Tune(workflow.WorkerConfig{Concurrency: 8}).Build()
-workflow.IdempotencyKey(ctx) // inside a step: "<run id>/<step key>"
-```
+## Consequences
 
-Options are sealed typed values: `Retry` (step + define default), `Timeout` (step attempt + run),
-`Key` (start), `Version` (define). Step errors are always `*StepError{Step, Attempts, Message}`,
-reconstructed from storage, so first execution and replay behave the same.
-
-## Runtime rules
-
-- Step key = name, repeats get `name#2`, `name#3` (`#` forbidden in names). Stored kind is checked
-  on replay: a mismatch fails the run with `ErrNonDeterministic`.
-- One queue job per run (`runs.job_id`), queue `pgworkflow:<name>` (`@<version>` when versioned),
-  so workers drain only their versions. Waiting = `queue.SnoozeTx` (attempt not consumed, zero time =
-  until woken); signal/child completion/cancel = `queue.WakeTx` + NOTIFY.
-- Activation start bumps `runs.lease`; every write locks the run `FOR SHARE` and checks
-  `lease` + `status='running'` (fencing). External mutators (signal, cancel, child completion) lock
-  `FOR UPDATE`, so they serialize with the single end-of-activation park.
-- Suspending ops record why and return `errSuspended`; after one suspension every durable op returns
-  it (guards swallowed errors). Park tx re-checks signals/children/wake times; if ready, re-execute
-  in-process instead of parking.
-- Step: `running` marker (attempts+1) before executing, so a crash counts as a failed attempt.
-  Backoff <= ~1s retries in-process, longer parks with `status='retrying', wake_at`.
-- DB time for all wake times; local monotonic clock only for the remainder after one DB reading.
-- Heartbeat (`queue.Heartbeat`) every VisibilityTimeout/3 + per-run NOTIFY subscription detect
-  cancellation and lost leases, cancelling the activation context.
-- Failed or cancelled runs cancel non-terminal descendants; terminal transitions wake the parent and
-  NOTIFY `pgworkflow:<run id>` for `Result`.
-
-## Schema
-
-`pgworkflow_runs` (id uuidv7, workflow, version, key unique per workflow, status
-pending|running|waiting|succeeded|failed|cancelled, input/output/error jsonb, parent_run_id,
-parent_step, job_id, lease, deadline_at, wake_at, timestamps), `pgworkflow_steps`
-(PK run_id+name, kind step|sleep|signal|child, status running|waiting|retrying|succeeded|failed|timed_out,
-attempts, output, error, wake_at, child_run_id, signal), `pgworkflow_signals` (id, run_id, name,
-payload, received_by, created_at; partial index on unreceived).
-
-## Remaining work
-
-1. queue: `SnoozeTx`, `WakeTx`, `Heartbeat`, `Subscribe`/`NotifyTx` + tests.
-2. workflow package rewrite + exhaustive testcontainers tests (one container per package, DB per test, `-race`).
-3. fx module, adminui (step timeline), playground, example, READMEs.
-4. echopoint companion PR (openapisyncs) after a pgkit release.
+- Workflows read as plain Go, with typed inputs, outputs, signals and children.
+- Steps other than `TxStep` are at least once; users pass `IdempotencyKey` to external
+  systems.
+- Incompatible changes need `workflow.Version(n)` and both definitions registered until
+  old runs finish. There is no static graph to diff.
+- The admin UI shows a checkpoint timeline instead of a graph.
+- Consumers port their definitions and drop the old tables after draining them.
+- The queue gained `SnoozeTx`, `WakeTx`, `Heartbeat`, `Subscribe`/`NotifyTx` and scoped
+  `Reap`, which other job types can use too.
