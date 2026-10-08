@@ -197,7 +197,7 @@ func TestRetryResumesAFailedRunFromItsCheckpoints(t *testing.T) {
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
 	_, err := result(h, run)
-	requireRunError(t, err)
+	requireFailed(t, err)
 
 	close(healthy)
 	if err := h.client.Retry(h.ctx, run.ID); err != nil {
@@ -234,7 +234,7 @@ func TestRetryResumesAFailedChild(t *testing.T) {
 	h.startWorker(parent, fragile)
 	run := mustStart(h, parent, struct{}{})
 	_, err := result(h, run)
-	requireRunError(t, err)
+	requireFailed(t, err)
 
 	close(healthy)
 	if err := h.client.Retry(h.ctx, run.ID); err != nil {

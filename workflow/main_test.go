@@ -385,6 +385,13 @@ func requireErrorIs(t *testing.T, err, target error) {
 	}
 }
 
+func requireFailed(t *testing.T, err error) {
+	t.Helper()
+	if runErr := requireRunError(t, err); runErr.Status != RunFailed {
+		t.Fatalf("run status = %s, want failed", runErr.Status)
+	}
+}
+
 func requireRunError(t *testing.T, err error) *RunError {
 	t.Helper()
 	var runErr *RunError

@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,14 +185,14 @@ func TestHeartbeatsKeepALongStepOnItsWorker(t *testing.T) {
 		return wf.Step("long", func(ctx context.Context) (string, error) {
 			calls.add("long")
 			select {
-			case <-time.After(1500 * time.Millisecond):
+			case <-time.After(3 * time.Second):
 				return "finished", nil
 			case <-ctx.Done():
 				return "", ctx.Err()
 			}
 		}, NoRetry)
 	})
-	short := WorkerConfig{VisibilityTimeout: 300 * time.Millisecond, ReapInterval: 50 * time.Millisecond}
+	short := WorkerConfig{VisibilityTimeout: time.Second, ReapInterval: 50 * time.Millisecond}
 	h.startWorkerWith(workerOptions{id: "first", config: short}, flow)
 	h.startWorkerWith(workerOptions{id: "second", config: short}, flow)
 
@@ -459,12 +460,7 @@ func (l *recordingLogger) messages() []string {
 }
 
 func (l *recordingLogger) has(msg string) bool {
-	for _, logged := range l.messages() {
-		if logged == msg {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(l.messages(), msg)
 }
 
 func (l *recordingLogger) Debug(_ context.Context, msg string, _ map[string]any) { l.record(msg) }

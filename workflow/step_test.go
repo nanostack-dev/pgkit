@@ -99,7 +99,7 @@ func TestANonRetryableErrorFailsTheStepAtOnce(t *testing.T) {
 
 	_, err := result(h, run)
 
-	requireRunError(t, err)
+	requireFailed(t, err)
 	if calls.get("validate") != 1 {
 		t.Fatalf("calls = %d", calls.get("validate"))
 	}
@@ -284,7 +284,7 @@ func TestAResultThatCannotBeEncodedFailsTheStepWithoutRetry(t *testing.T) {
 
 	_, err := result(h, run)
 
-	requireRunError(t, err)
+	requireFailed(t, err)
 	if calls.get("channel") != 1 || !strings.Contains(h.step(run.ID, "channel").Error, "encode chan int result") {
 		t.Fatalf("calls = %d, step = %+v", calls.get("channel"), h.step(run.ID, "channel"))
 	}
@@ -331,8 +331,7 @@ func TestAWorkflowCanRecoverFromAFailedStep(t *testing.T) {
 			return "", err
 		}
 		_, err := wf.Step("charge", func(context.Context) (int, error) { return 0, errors.New("card declined") }, NoRetry)
-		var stepErr *StepError
-		if errors.As(err, &stepErr) {
+		if stepErr, failed := errors.AsType[*StepError](err); failed {
 			if _, err := wf.Step("release-stock", func(context.Context) (bool, error) { calls.add("release"); return true, nil }); err != nil {
 				return "", err
 			}
@@ -481,7 +480,7 @@ func TestSwallowingANonDeterminismErrorStillFailsTheRun(t *testing.T) {
 	h.fastForward(run.ID)
 
 	_, err := result(h, run)
-	requireRunError(t, err)
+	requireFailed(t, err)
 }
 
 func TestARecordedResultThatNoLongerDecodesFailsTheRun(t *testing.T) {
@@ -638,7 +637,7 @@ func TestTxStepThatFailsForGoodLeavesNoWrites(t *testing.T) {
 
 	_, err := result(h, mustStart(h, flow, struct{}{}))
 
-	requireRunError(t, err)
+	requireFailed(t, err)
 	if h.queryInt(`SELECT count(*) FROM ledger`) != 0 {
 		t.Fatal("a failed transactional step left its write")
 	}
@@ -744,8 +743,7 @@ func TestAsyncStepFailuresSurfaceThroughWait(t *testing.T) {
 	h := newHarness(t)
 	flow := Define("parallel-failure", func(wf *Context, _ struct{}) (string, error) {
 		_, err := wf.Async("broken", func(context.Context) (int, error) { return 0, errors.New("down") }, NoRetry).Wait()
-		var stepErr *StepError
-		if errors.As(err, &stepErr) {
+		if stepErr, failed := errors.AsType[*StepError](err); failed {
 			return stepErr.Message, nil
 		}
 		return "", err

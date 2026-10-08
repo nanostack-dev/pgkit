@@ -96,13 +96,22 @@ const (
 	maxReplays          = 100
 )
 
-func (a *activation) stopWith(reason stopReason, err error) error {
+// recordStop records why the activation stops, unless a stronger reason is
+// already recorded.
+func (a *activation) recordStop(reason stopReason, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if reason > a.stop {
 		a.stop, a.stopErr = reason, err
 	}
-	return a.stopErr
+}
+
+// stopWith records why the activation stops and returns the error durable
+// operations return from now on.
+func (a *activation) stopWith(reason stopReason, err error) error {
+	a.recordStop(reason, err)
+	_, stopErr := a.stopState()
+	return stopErr
 }
 
 // stopped reports why the activation must not start new work, if it must: a
@@ -138,18 +147,24 @@ func (a *activation) suspendOn(condition wakeCondition) error {
 	return a.stopWith(suspended, ErrSuspended)
 }
 
-// interruption turns the cause of a cancelled run context into the reason the
-// activation stops.
+// interruption records why the run context ended and returns the error durable
+// operations return from now on.
 func (a *activation) interruption() error {
+	a.recordStop(a.interruptionReason())
+	_, stopErr := a.stopState()
+	return stopErr
+}
+
+func (a *activation) interruptionReason() (stopReason, error) {
 	switch cause := context.Cause(a.runCtx); {
 	case errors.Is(cause, ErrCancelled):
-		return a.stopWith(cancelled, ErrCancelled)
+		return cancelled, ErrCancelled
 	case errors.Is(cause, errRunTimedOut):
-		return a.stopWith(timedOut, errRunTimedOut)
+		return timedOut, errRunTimedOut
 	case errors.Is(cause, errLeaseLost):
-		return a.stopWith(leaseLost, ErrSuspended)
+		return leaseLost, ErrSuspended
 	default:
-		return a.stopWith(shuttingDown, ErrSuspended)
+		return shuttingDown, ErrSuspended
 	}
 }
 
@@ -326,12 +341,12 @@ func (a *activation) execute(workerCtx context.Context) error {
 		var output json.RawMessage
 		var err error
 		if a.runCtx.Err() != nil {
-			a.interruption()
+			a.recordStop(a.interruptionReason())
 		} else {
 			output, err = a.executeFunction()
 		}
 		if reason, _ := a.stopState(); reason == infrastructureFailed && a.runCtx.Err() != nil {
-			a.interruption()
+			a.recordStop(a.interruptionReason())
 		}
 		reason, stopErr := a.stopState()
 		switch reason {
@@ -457,7 +472,7 @@ func (a *activation) park(replay int) (parked bool, err error) {
 		`SELECT status FROM pgworkflow_runs WHERE id = $1 AND lease = $2 FOR UPDATE`, a.runID, a.lease,
 	).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && status != RunRunning && status != RunCancelled) {
-		a.stopWith(leaseLost, ErrSuspended)
+		a.recordStop(leaseLost, ErrSuspended)
 		return true, nil
 	}
 	if err != nil {
@@ -606,7 +621,7 @@ func (a *activation) acknowledgeCancellationTx(ctx context.Context, tx *sql.Tx) 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("workflow: commit cancelled run: %w", err)
 	}
-	a.stopWith(cancelled, ErrCancelled)
+	a.recordStop(cancelled, ErrCancelled)
 	return nil
 }
 

@@ -183,7 +183,7 @@ func TestAFailingParentCancelsItsUnfinishedChildren(t *testing.T) {
 	run := mustStart(h, parent, struct{}{})
 
 	_, err := result(h, run)
-	requireRunError(t, err)
+	requireFailed(t, err)
 	childID := h.step(run.ID, "child").ChildRunID
 
 	h.waitForStatus(childID, RunCancelled)
