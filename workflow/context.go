@@ -301,52 +301,79 @@ func runAttempt[T any](act *activation, key string, config stepConfig, transacti
 		stepCtx, cancel = context.WithTimeout(stepCtx, config.timeout)
 		defer cancel()
 	}
-	if !transactional {
-		value, err := callStep(act, stepCtx, fn, nil)
-		if err != nil && act.runCtx.Err() != nil {
-			return attempt[T]{stop: act.interruptAttempt(key)}
-		}
-		if err != nil {
-			return attempt[T]{failure: err}
-		}
-		output, err := json.Marshal(value)
-		if err != nil {
-			return attempt[T]{failure: NonRetryable(fmt.Errorf("encode %T result: %w", value, err))}
-		}
-		if err := act.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error {
-			return act.recordSucceededStepTx(ctx, tx, key, output)
-		}); err != nil {
-			return attempt[T]{stop: err}
-		}
-		return attempt[T]{value: value}
+	if transactional {
+		return runTransactionalAttempt(act, key, config, stepCtx, fn)
 	}
+	value, err := callStep(act, stepCtx, fn, nil)
+	if err != nil {
+		return failedAttempt[T](act, key, err)
+	}
+	output, recorded, err := encodeResult(value)
+	if err != nil {
+		return attempt[T]{failure: err}
+	}
+	if err := act.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error {
+		return act.recordSucceededStepTx(ctx, tx, key, output)
+	}); err != nil {
+		return attempt[T]{stop: err}
+	}
+	return attempt[T]{value: recorded}
+}
 
-	bookkeepingCtx, cancel := act.bookkeepingContext()
-	defer cancel()
-	tx, err := act.fencedTx(bookkeepingCtx)
+// runTransactionalAttempt runs fn in the transaction that records its result. The
+// transaction lasts as long as the step, not the bookkeeping timeout, and holds a
+// share lock on the run, so a worker taking the run over waits for it to end.
+func runTransactionalAttempt[T any](act *activation, key string, config stepConfig, stepCtx context.Context, fn func(context.Context, *sql.Tx) (T, error)) attempt[T] {
+	txCtx := context.WithoutCancel(act.runCtx)
+	if config.timeout > 0 {
+		var cancel context.CancelFunc
+		txCtx, cancel = context.WithTimeout(txCtx, config.timeout+bookkeepingTimeout)
+		defer cancel()
+	}
+	tx, err := act.fencedTx(txCtx)
 	if err != nil {
 		return attempt[T]{stop: err}
 	}
 	defer func() { _ = tx.Rollback() }()
 	value, err := callStep(act, stepCtx, fn, tx)
-	if err != nil && act.runCtx.Err() != nil {
+	if err != nil {
 		_ = tx.Rollback()
-		return attempt[T]{stop: act.interruptAttempt(key)}
+		return failedAttempt[T](act, key, err)
 	}
+	output, recorded, err := encodeResult(value)
 	if err != nil {
 		return attempt[T]{failure: err}
 	}
-	output, err := json.Marshal(value)
-	if err != nil {
-		return attempt[T]{failure: NonRetryable(fmt.Errorf("encode %T result: %w", value, err))}
-	}
-	if err := act.recordSucceededStepTx(bookkeepingCtx, tx, key, output); err != nil {
+	if err := act.recordSucceededStepTx(txCtx, tx, key, output); err != nil {
 		return attempt[T]{stop: act.infrastructureFailure(err)}
 	}
 	if err := tx.Commit(); err != nil {
-		return attempt[T]{failure: fmt.Errorf("commit: %w", err)}
+		return attempt[T]{stop: act.infrastructureFailure(fmt.Errorf("workflow: commit %q: %w", key, err))}
 	}
-	return attempt[T]{value: value}
+	return attempt[T]{value: recorded}
+}
+
+// failedAttempt turns a step error into a failed attempt, unless the run context
+// ended: then the error is likely its consequence and the activation stops.
+func failedAttempt[T any](act *activation, key string, err error) attempt[T] {
+	if act.runCtx.Err() != nil {
+		return attempt[T]{stop: act.interruptAttempt(key)}
+	}
+	return attempt[T]{failure: err}
+}
+
+// encodeResult encodes a step result and decodes it back, so the first execution
+// returns exactly what replays will: fields JSON drops are dropped both times.
+func encodeResult[T any](value T) (json.RawMessage, T, error) {
+	var recorded T
+	output, err := json.Marshal(value)
+	if err != nil {
+		return nil, recorded, NonRetryable(fmt.Errorf("encode %T result: %w", value, err))
+	}
+	if err := json.Unmarshal(output, &recorded); err != nil {
+		return nil, recorded, NonRetryable(fmt.Errorf("%T result does not decode from its own JSON: %w", value, err))
+	}
+	return output, recorded, nil
 }
 
 func callStep[T any](act *activation, ctx context.Context, fn func(context.Context, *sql.Tx) (T, error), tx *sql.Tx) (value T, err error) {
@@ -370,12 +397,12 @@ func (a *activation) stepConfig(options []StepOption) stepConfig {
 	for _, option := range options {
 		option.applyToStep(&config)
 	}
-	if config.retry == nil {
-		defaults := a.def.retry
-		config.retry = &defaults
+	retry := a.def.retry
+	if config.retry != nil {
+		retry = retry.overriddenBy(*config.retry)
 	}
-	withDefaults := config.retry.withDefaults()
-	config.retry = &withDefaults
+	retry = retry.withDefaults()
+	config.retry = &retry
 	return config
 }
 
@@ -424,6 +451,7 @@ INSERT INTO pgworkflow_steps (run_id, name, kind, status, attempts)
 VALUES ($1, $2, 'step', 'running', 1)
 ON CONFLICT (run_id, name) DO UPDATE
 SET status = 'running', attempts = pgworkflow_steps.attempts + 1, wake_at = NULL, updated_at = NOW()
+WHERE pgworkflow_steps.status IN ('running', 'retrying')
 RETURNING attempts`, a.runID, key).Scan(&number)
 	})
 	if err != nil {
@@ -459,11 +487,17 @@ func (a *activation) recordFailedAttempt(key string, number int, failure error, 
 	message := failure.Error()
 	if isNonRetryable(failure) || number >= retry.MaxAttempts {
 		err := a.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `
+			res, err := tx.ExecContext(ctx, `
 UPDATE pgworkflow_steps
 SET status = 'failed', error = $3, wake_at = NULL, completed_at = NOW(), updated_at = NOW()
-WHERE run_id = $1 AND name = $2`, a.runID, key, message)
-			return err
+WHERE run_id = $1 AND name = $2 AND status = 'running' AND attempts = $4`, a.runID, key, message, number)
+			if err != nil {
+				return err
+			}
+			if updated, _ := res.RowsAffected(); updated == 0 {
+				return fmt.Errorf("workflow: checkpoint %q changed while attempt %d ran", key, number)
+			}
+			return nil
 		})
 		if err != nil {
 			return retryPlan{}, err
@@ -477,8 +511,8 @@ WHERE run_id = $1 AND name = $2`, a.runID, key, message)
 		_, cp, err = scanCheckpoint(tx.QueryRowContext(ctx, `
 UPDATE pgworkflow_steps
 SET status = 'retrying', error = $3, wake_at = NOW() + make_interval(secs => $4), updated_at = NOW()
-WHERE run_id = $1 AND name = $2
-RETURNING `+checkpointColumns, a.runID, key, message, retry.delayAfter(number).Seconds()))
+WHERE run_id = $1 AND name = $2 AND status = 'running' AND attempts = $5
+RETURNING `+checkpointColumns, a.runID, key, message, retry.delayAfter(number).Seconds(), number))
 		return err
 	})
 	if err != nil {

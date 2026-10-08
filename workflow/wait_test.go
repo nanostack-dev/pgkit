@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nanostack-dev/pgkit/queue"
 )
 
 func TestSleepParksTheRunAndFreesTheWorker(t *testing.T) {
@@ -311,7 +313,7 @@ func TestReceiveForeverParksWithoutAWakeTime(t *testing.T) {
 	if !waiting.WakeAt.IsZero() || !h.step(run.ID, "approved").WakeAt.IsZero() {
 		t.Fatalf("a receive without timeout set a wake time: %+v", waiting)
 	}
-	if h.queryInt(`SELECT count(*) FROM pgqueue_jobs WHERE available_at = 'infinity'`) != 1 {
+	if h.queryInt(`SELECT count(*) FROM pgqueue_jobs WHERE available_at = $1`, queue.ParkedUntil) != 1 {
 		t.Fatal("the run's job is not parked until woken")
 	}
 }

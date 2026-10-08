@@ -31,10 +31,10 @@ type stepConfig struct {
 }
 
 // Retry is how many times a step is attempted and how long it waits between
-// attempts. Zero fields take the defaults: 3 attempts, the first retry after one
-// second, doubling up to one minute (or up to Backoff, when that is longer). Pass it
-// to Define to change the default for every step of a workflow, or to a step to
-// override it.
+// attempts. Pass it to Define to set the policy of every step of a workflow, or to
+// a step to override some of it: a step's zero fields keep the workflow's values.
+// Fields still zero take the defaults: 3 attempts, the first retry after one second,
+// doubling up to one minute (or up to Backoff, when that is longer).
 type Retry struct {
 	MaxAttempts int
 	Backoff     time.Duration
@@ -56,6 +56,19 @@ func (r Retry) applyToStep(c *stepConfig) {
 
 func (r Retry) applyToDefinition(d *definition) {
 	d.retry = r
+}
+
+func (r Retry) overriddenBy(override Retry) Retry {
+	if override.MaxAttempts > 0 {
+		r.MaxAttempts = override.MaxAttempts
+	}
+	if override.Backoff > 0 {
+		r.Backoff = override.Backoff
+	}
+	if override.MaxBackoff > 0 {
+		r.MaxBackoff = override.MaxBackoff
+	}
+	return r
 }
 
 func (r Retry) withDefaults() Retry {

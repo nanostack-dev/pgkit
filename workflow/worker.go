@@ -86,6 +86,7 @@ func (b WorkerBuilder) Tune(config WorkerConfig) WorkerBuilder {
 // Worker executes the runs of its workflows.
 type Worker struct {
 	client       *Client
+	config       WorkerConfig
 	queueWorkers []*queue.Worker
 	ready        chan struct{}
 	running      atomic.Bool
@@ -109,7 +110,7 @@ func (b WorkerBuilder) Build() (*Worker, error) {
 		definitions[def.queueName()] = def
 	}
 
-	worker := &Worker{client: b.client, ready: make(chan struct{})}
+	worker := &Worker{client: b.client, config: config, ready: make(chan struct{})}
 	for slot := range config.Concurrency {
 		builder := b.client.queue.Worker(fmt.Sprintf("%s/%d", b.id, slot+1)).Tune(queue.WorkerConfig{
 			VisibilityTimeout: config.VisibilityTimeout,
@@ -151,6 +152,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	for i, queueWorker := range w.queueWorkers {
 		group.Go(func() { errs[i] = queueWorker.Run(ctx) })
 	}
+	group.Go(func() { w.reconcile(ctx) })
 	group.Go(func() {
 		for _, queueWorker := range w.queueWorkers {
 			select {
@@ -167,6 +169,22 @@ func (w *Worker) Run(ctx context.Context) error {
 	})
 	group.Wait()
 	return errors.Join(errs...)
+}
+
+// reconcile periodically fails runs whose job the queue gave up on.
+func (w *Worker) reconcile(ctx context.Context) {
+	ticker := time.NewTicker(w.config.ReapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.client.failOrphanedRuns(ctx); err != nil && ctx.Err() == nil {
+				w.client.log.Warn(ctx, "workflow reconcile failed", map[string]any{"error": err.Error()})
+			}
+		}
+	}
 }
 
 // Ready is closed once every slot of the worker is ready: from then on a run that
@@ -235,4 +253,82 @@ RETURNING lease, input, COALESCE(parent_run_id, ''), deadline_at, EXTRACT(EPOCH 
 		return nil, err
 	}
 	return act, nil
+}
+
+// failOrphanedRuns fails unfinished runs whose job the queue gave up on, after
+// crashes or reaps used all its attempts: no activation would ever finish them.
+func (c *Client) failOrphanedRuns(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT run.id, COALESCE(job.last_error, '')
+FROM pgworkflow_runs run
+JOIN pgqueue_jobs job ON job.id = run.job_id
+WHERE run.status IN ('pending', 'running', 'waiting') AND job.status = 'failed'
+LIMIT 100`)
+	if err != nil {
+		return fmt.Errorf("workflow: find orphaned runs: %w", err)
+	}
+	type orphan struct{ runID, lastError string }
+	var orphans []orphan
+	for rows.Next() {
+		var found orphan
+		if err := rows.Scan(&found.runID, &found.lastError); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		orphans = append(orphans, found)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, found := range orphans {
+		if err := c.failOrphanedRun(ctx, found.runID, found.lastError); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) failOrphanedRun(ctx context.Context, runID, lastError string) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var parentRunID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT parent_run_id FROM pgworkflow_runs WHERE id = $1`, runID).Scan(&parentRunID); err != nil {
+		return err
+	}
+	if parentRunID.Valid {
+		if err := c.wakeParentTx(ctx, tx, parentRunID.String); err != nil {
+			return err
+		}
+	}
+	var orphaned bool
+	err = tx.QueryRowContext(ctx, `
+SELECT TRUE FROM pgworkflow_runs run JOIN pgqueue_jobs job ON job.id = run.job_id
+WHERE run.id = $1 AND run.status IN ('pending', 'running', 'waiting') AND job.status = 'failed'
+FOR UPDATE OF run`, runID).Scan(&orphaned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	message := "the queue gave up on the run's job"
+	if lastError != "" {
+		message += ": " + lastError
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE pgworkflow_runs
+SET status = 'failed', error = $2, completed_at = NOW(), wake_at = NULL, updated_at = NOW()
+WHERE id = $1`, runID, message); err != nil {
+		return err
+	}
+	if err := c.cancelDescendantsTx(ctx, tx, runID); err != nil {
+		return err
+	}
+	if err := c.queue.NotifyTx(ctx, tx, runNotifyKey(runID)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

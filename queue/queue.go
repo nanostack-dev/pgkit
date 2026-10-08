@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"crypto/subtle"
 	"database/sql"
 	"errors"
@@ -647,14 +648,38 @@ func failCore(ctx context.Context, exec execer, id int64, cause error, c *Client
 // ReapStuckJobs (P0 #1)
 // ---------------------------------------------------------------------------
 
-// ReapStuckJobs reclaims jobs stuck in processing beyond visibilityTimeout.
-// Jobs with remaining attempts are requeued to pending; exhausted jobs are failed.
+// ReapStuckJobs reclaims jobs of every queue stuck in processing beyond
+// visibilityTimeout. Jobs with remaining attempts are requeued to pending;
+// exhausted jobs are failed. Reap limits this to chosen queues.
 func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Duration) (ReapResult, error) {
+	return c.Reap(ctx, ReapParams{VisibilityTimeout: visibilityTimeout})
+}
+
+// ReapParams selects the stuck jobs Reap reclaims: those processing for longer
+// than VisibilityTimeout, in QueueNames when it is not empty.
+type ReapParams struct {
+	VisibilityTimeout time.Duration
+	QueueNames        []string
+}
+
+// Reap reclaims stuck jobs as ReapParams selects them. Jobs with remaining attempts
+// are requeued to pending; exhausted jobs are failed.
+func (c *Client) Reap(ctx context.Context, p ReapParams) (ReapResult, error) {
 	if c == nil || c.db == nil {
 		return ReapResult{}, ErrNilDB
 	}
+	var queueNames any
+	if len(p.QueueNames) > 0 {
+		encoded, err := json.Marshal(p.QueueNames)
+		if err != nil {
+			return ReapResult{}, fmt.Errorf("pgqueue: reap queue names: %w", err)
+		}
+		queueNames = string(encoded)
+	}
+	const stuck = `status = 'processing'
+			  AND claimed_at < NOW() - make_interval(secs => $1)
+			  AND ($2::jsonb IS NULL OR queue_name IN (SELECT jsonb_array_elements_text($2::jsonb)))`
 
-	// Requeue: processing + stale + attempts < max_attempts -> pending
 	resRequeue, err := c.db.ExecContext(ctx,
 		`WITH requeued AS (
 			UPDATE pgqueue_jobs
@@ -663,20 +688,18 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 			    claimed_at = NULL,
 			    available_at = NOW(),
 			    updated_at = NOW()
-			WHERE status = 'processing'
-			  AND claimed_at < NOW() - make_interval(secs => $1)
+			WHERE `+stuck+`
 			  AND attempts < max_attempts
 			RETURNING queue_name
 		 )
 		 SELECT 1 FROM requeued, `+notifySQL("requeued"),
-		visibilityTimeout.Seconds(),
+		p.VisibilityTimeout.Seconds(), queueNames,
 	)
 	if err != nil {
 		return ReapResult{}, fmt.Errorf("pgqueue: reap requeue: %w", err)
 	}
 	requeued, _ := resRequeue.RowsAffected()
 
-	// Fail: processing + stale + attempts >= max_attempts -> failed
 	resFail, err := c.db.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET status = 'failed',
@@ -685,10 +708,9 @@ func (c *Client) ReapStuckJobs(ctx context.Context, visibilityTimeout time.Durat
 		     claimed_at = NULL,
 		     done_at = NOW(),
 		     updated_at = NOW()
-		 WHERE status = 'processing'
-		   AND claimed_at < NOW() - make_interval(secs => $1)
+		 WHERE `+stuck+`
 		   AND attempts >= max_attempts`,
-		visibilityTimeout.Seconds(),
+		p.VisibilityTimeout.Seconds(), queueNames,
 	)
 	if err != nil {
 		return ReapResult{Requeued: requeued}, fmt.Errorf("pgqueue: reap fail: %w", err)

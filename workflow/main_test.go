@@ -450,3 +450,7 @@ func (g *gate) awaitReached(t *testing.T) {
 func (g *gate) release() {
 	g.once.Do(func() { close(g.open) })
 }
+
+func queueListParams() queue.ListJobsParams {
+	return queue.ListJobsParams{Limit: 100}
+}

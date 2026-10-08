@@ -90,7 +90,7 @@ func TestSnoozeTxDelaysTheJobWithoutSpendingItsAttempt(t *testing.T) {
 	job := enqueueAndClaim(t, q, queueName, 1)
 
 	until := databaseNow(t, q).Add(time.Hour)
-	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, job.ID, until) }); err != nil {
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *job, until) }); err != nil {
 		t.Fatalf("snooze: %v", err)
 	}
 
@@ -112,10 +112,17 @@ func TestSnoozeTxWithAZeroTimeParksTheJobUntilWakeTx(t *testing.T) {
 	queueName := uniqueQueueName(t)
 	job := enqueueAndClaim(t, q, queueName, 1)
 
-	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, job.ID, time.Time{}) }); err != nil {
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *job, time.Time{}) }); err != nil {
 		t.Fatalf("snooze: %v", err)
 	}
 	requireClaimable(t, q, queueName, false)
+	parked, err := q.GetJob(context.Background(), job.ID)
+	if err != nil || !parked.AvailableAt.Equal(ParkedUntil) {
+		t.Fatalf("parked job = %+v, err = %v", parked, err)
+	}
+	if _, err := q.ListJobs(context.Background(), ListJobsParams{Limit: 100}); err != nil {
+		t.Fatalf("a parked job breaks ListJobs: %v", err)
+	}
 
 	if err := inTx(t, q, func(tx *sql.Tx) error { return q.WakeTx(context.Background(), tx, job.ID) }); err != nil {
 		t.Fatalf("wake: %v", err)
@@ -134,7 +141,7 @@ func TestSnoozeTxUntilAPastTimeNotifiesWorkers(t *testing.T) {
 	requireWake(t, sub, 5*time.Second)
 
 	past := databaseNow(t, q).Add(-time.Minute)
-	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, job.ID, past) }); err != nil {
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *job, past) }); err != nil {
 		t.Fatalf("snooze: %v", err)
 	}
 	requireWake(t, sub, 5*time.Second)
@@ -149,7 +156,7 @@ func TestSnoozeTxUntilALaterTimeDoesNotNotify(t *testing.T) {
 	requireWake(t, sub, 5*time.Second)
 
 	later := databaseNow(t, q).Add(time.Hour)
-	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, job.ID, later) }); err != nil {
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *job, later) }); err != nil {
 		t.Fatalf("snooze: %v", err)
 	}
 	requireNoWake(t, sub, 300*time.Millisecond)
@@ -162,7 +169,11 @@ func TestSnoozeTxRefusesAJobThatIsNotProcessing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	err = inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, id, time.Time{}) })
+	pending, err := q.GetJob(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	err = inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *pending, time.Time{}) })
 	if !errors.Is(err, ErrJobNotFound) {
 		t.Fatalf("expected ErrJobNotFound, got %v", err)
 	}
@@ -175,7 +186,7 @@ func TestSnoozeTxRollsBackWithItsTransaction(t *testing.T) {
 
 	rollback := errors.New("rollback")
 	err := inTx(t, q, func(tx *sql.Tx) error {
-		if err := q.SnoozeTx(context.Background(), tx, job.ID, time.Time{}); err != nil {
+		if err := q.SnoozeTx(context.Background(), tx, *job, time.Time{}); err != nil {
 			return err
 		}
 		return rollback
@@ -422,5 +433,49 @@ func TestAHandlerFinishingDuringShutdownStillSettlesItsJob(t *testing.T) {
 	}
 	if job.Status != StatusDone {
 		t.Fatalf("status = %s, want done", job.Status)
+	}
+}
+
+func TestSnoozeTxRefusesAClaimTheReaperTookBack(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	stale := enqueueAndClaim(t, q, queueName, 3)
+	if _, err := q.DB().Exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - interval '1 hour' WHERE id = $1`, stale.ID); err != nil {
+		t.Fatalf("age claim: %v", err)
+	}
+	if _, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: time.Minute, QueueNames: []string{queueName}}); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	current := requireClaimable(t, q, queueName, true)
+
+	err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *stale, time.Time{}) })
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("a stale claim snoozed the job: %v", err)
+	}
+	still, err := q.GetJob(context.Background(), current.ID)
+	if err != nil || still.Status != StatusProcessing {
+		t.Fatalf("job = %+v, err = %v", still, err)
+	}
+}
+
+func TestReapOnlyTouchesTheChosenQueues(t *testing.T) {
+	q := sharedQueue(t)
+	mine, other := uniqueQueueName(t), uniqueQueueName(t)+"-other"
+	mineJob := enqueueAndClaim(t, q, mine, 3)
+	otherJob := enqueueAndClaim(t, q, other, 3)
+	if _, err := q.DB().Exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - interval '1 hour' WHERE id IN ($1, $2)`, mineJob.ID, otherJob.ID); err != nil {
+		t.Fatalf("age claims: %v", err)
+	}
+
+	result, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: time.Minute, QueueNames: []string{mine}})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	if result.Requeued != 1 {
+		t.Fatalf("requeued %d jobs, want 1", result.Requeued)
+	}
+	if job, _ := q.GetJob(context.Background(), otherJob.ID); job.Status != StatusProcessing {
+		t.Fatalf("another queue's job was reaped: %s", job.Status)
 	}
 }

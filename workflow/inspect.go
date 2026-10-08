@@ -131,8 +131,10 @@ func (c *Client) CountRuns(ctx context.Context, params ListRunsParams) (int64, e
 }
 
 // Purge deletes finished runs completed more than params.OlderThan ago, with their
-// checkpoints and signals, and returns how many runs it deleted. Run it
-// periodically to bound the tables; the queue's own Purge removes finished jobs.
+// checkpoints and signals, and returns how many runs it deleted. A child whose
+// parent is still unfinished is kept, as the parent may still read its result. Run
+// Purge periodically to bound the tables; the queue's own Purge removes finished
+// jobs.
 func (c *Client) Purge(ctx context.Context, params PurgeParams) (int64, error) {
 	var limit any
 	if params.Limit > 0 {
@@ -141,10 +143,13 @@ func (c *Client) Purge(ctx context.Context, params PurgeParams) (int64, error) {
 	res, err := c.db.ExecContext(ctx, `
 DELETE FROM pgworkflow_runs
 WHERE id IN (
-    SELECT id FROM pgworkflow_runs
-    WHERE status IN ('succeeded', 'failed', 'cancelled')
-      AND completed_at < NOW() - make_interval(secs => $1)
-    ORDER BY completed_at
+    SELECT run.id FROM pgworkflow_runs run
+    WHERE run.status IN ('succeeded', 'failed', 'cancelled')
+      AND run.completed_at < NOW() - make_interval(secs => $1)
+      AND NOT EXISTS (
+          SELECT 1 FROM pgworkflow_runs parent
+          WHERE parent.id = run.parent_run_id AND parent.status IN ('pending', 'running', 'waiting'))
+    ORDER BY run.completed_at
     LIMIT $2)`, max(params.OlderThan, 0).Seconds(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("workflow: purge runs: %w", err)

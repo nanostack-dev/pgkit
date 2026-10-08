@@ -379,8 +379,9 @@ func (a *activation) executeFunction() (output json.RawMessage, err error) {
 	return a.def.execute(wf, a.input)
 }
 
-// watch heartbeats the job while the activation runs and cancels the run context
-// when the run is cancelled or another worker takes it over.
+// watch heartbeats the job until the activation ends, also after the run context
+// ended while a step finishes, and cancels the run context when the run is
+// cancelled or another worker takes it over.
 func (a *activation) watch(cancel context.CancelCauseFunc) (stop func()) {
 	done := make(chan struct{})
 	var stopped sync.WaitGroup
@@ -395,8 +396,6 @@ func (a *activation) watch(cancel context.CancelCauseFunc) (stop func()) {
 		for {
 			select {
 			case <-done:
-				return
-			case <-a.runCtx.Done():
 				return
 			case <-heartbeat.C:
 				ctx, cancelBeat := a.bookkeepingContext()
@@ -496,7 +495,7 @@ func (a *activation) park(replay int) (parked bool, err error) {
 	); err != nil {
 		return false, fmt.Errorf("workflow: park run: %w", err)
 	}
-	if err := a.client.queue.SnoozeTx(ctx, tx, a.job.ID, wake); err != nil {
+	if err := a.client.queue.SnoozeTx(ctx, tx, a.job, wake); err != nil {
 		return false, fmt.Errorf("workflow: snooze run job: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -584,7 +583,7 @@ func (a *activation) release() error {
 	).Scan(&owned); err != nil {
 		return queue.Handled()
 	}
-	if err := a.client.queue.SnoozeTx(ctx, tx, a.job.ID, dueNow); err != nil {
+	if err := a.client.queue.SnoozeTx(ctx, tx, a.job, dueNow); err != nil {
 		return queue.Handled()
 	}
 	_ = tx.Commit()

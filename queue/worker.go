@@ -466,7 +466,7 @@ func (w *Worker) handBack(workerCtx context.Context, job *Job) {
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := w.client.SnoozeTx(ctx, tx, job.ID, time.Unix(0, 0)); err != nil {
+	if err := w.client.SnoozeTx(ctx, tx, *job, time.Unix(0, 0)); err != nil {
 		w.client.logError(ctx, "queue hand back failed", map[string]any{"id": job.ID, "error": err.Error()})
 		return
 	}
@@ -507,8 +507,10 @@ func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
 	}
 }
 
+// reap requeues stuck jobs of the worker's own queues only: its visibility timeout
+// says nothing about how long other queues' jobs may take.
 func (w *Worker) reap(ctx context.Context) error {
-	result, err := w.client.ReapStuckJobs(ctx, w.cfg.VisibilityTimeout)
+	result, err := w.client.Reap(ctx, ReapParams{VisibilityTimeout: w.cfg.VisibilityTimeout, QueueNames: w.registry.queueNames()})
 	if err != nil {
 		return err
 	}

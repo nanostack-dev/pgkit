@@ -186,7 +186,7 @@ func (c *Client) SignalTx[T any](ctx context.Context, tx *sql.Tx, runID string, 
 	if err != nil {
 		return fmt.Errorf("workflow: encode %T signal: %w", value, err)
 	}
-	status, jobID, err := lockRunTx(ctx, tx, runID)
+	status, jobID, err := lockRunToNotifyTx(ctx, tx, runID)
 	if err != nil {
 		return err
 	}
@@ -214,11 +214,23 @@ SELECT EXISTS (
 	return nil
 }
 
+// lockRunTx locks a run against every other change, for cancelling or retrying it.
 func lockRunTx(ctx context.Context, tx *sql.Tx, runID string) (RunStatus, sql.NullInt64, error) {
+	return lockRun(ctx, tx, runID, "FOR UPDATE")
+}
+
+// lockRunToNotifyTx locks a run against parking only. Waking a run must serialize
+// with its park, but not with its checkpoint writes, so a signal or a finishing
+// child does not wait for a transactional step in progress.
+func lockRunToNotifyTx(ctx context.Context, tx *sql.Tx, runID string) (RunStatus, sql.NullInt64, error) {
+	return lockRun(ctx, tx, runID, "FOR KEY SHARE")
+}
+
+func lockRun(ctx context.Context, tx *sql.Tx, runID, lockStrength string) (RunStatus, sql.NullInt64, error) {
 	var status RunStatus
 	var jobID sql.NullInt64
 	err := tx.QueryRowContext(ctx,
-		`SELECT status, job_id FROM pgworkflow_runs WHERE id = $1 FOR UPDATE`, runID,
+		`SELECT status, job_id FROM pgworkflow_runs WHERE id = $1 `+lockStrength, runID,
 	).Scan(&status, &jobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", jobID, fmt.Errorf("%w: %s", ErrRunNotFound, runID)
@@ -231,7 +243,7 @@ func lockRunTx(ctx context.Context, tx *sql.Tx, runID string) (RunStatus, sql.Nu
 
 // wakeParentTx locks the parent of a finishing run and wakes it if it is parked.
 func (c *Client) wakeParentTx(ctx context.Context, tx *sql.Tx, parentRunID string) error {
-	status, jobID, err := lockRunTx(ctx, tx, parentRunID)
+	status, jobID, err := lockRunToNotifyTx(ctx, tx, parentRunID)
 	if errors.Is(err, ErrRunNotFound) {
 		return nil
 	}
@@ -245,7 +257,8 @@ func (c *Client) wakeParentTx(ctx context.Context, tx *sql.Tx, parentRunID strin
 }
 
 // Cancel cancels a run and its unfinished descendants. A step running at that
-// moment sees its context cancelled; the run does not start new work. Cancelling a
+// moment sees its context cancelled and the run starts no new work; a
+// transactional step in progress commits or rolls back first. Cancelling a
 // cancelled run does nothing; cancelling a succeeded or failed one returns
 // ErrRunFinished.
 func (c *Client) Cancel(ctx context.Context, runID string) error {
@@ -293,8 +306,40 @@ func (c *Client) cancelDescendantsTx(ctx context.Context, tx *sql.Tx, runID stri
 
 // cancelTreeTx cancels the unfinished runs below runID, and runID itself when
 // includeRoot is set. It locks them from the top down and wakes their jobs, so
-// parked runs settle their jobs and running ones notice through their watchers.
+// parked runs settle their jobs and running ones notice through their watchers. It
+// looks again until no unfinished descendant is left: a child started while the
+// first lookup waited for a lock is only visible to a later one.
 func (c *Client) cancelTreeTx(ctx context.Context, tx *sql.Tx, runID string, includeRoot bool) error {
+	for {
+		runs, err := unfinishedTreeTx(ctx, tx, runID, includeRoot)
+		if err != nil || len(runs) == 0 {
+			return err
+		}
+		for _, run := range runs {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE pgworkflow_runs
+SET status = 'cancelled', error = 'cancelled', completed_at = NOW(), wake_at = NULL, updated_at = NOW()
+WHERE id = $1`, run.id); err != nil {
+				return fmt.Errorf("workflow: cancel run: %w", err)
+			}
+			if run.jobID.Valid {
+				if err := c.queue.WakeTx(ctx, tx, run.jobID.Int64); err != nil {
+					return err
+				}
+			}
+			if err := c.queue.NotifyTx(ctx, tx, runNotifyKey(run.id)); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+type runToCancel struct {
+	id    string
+	jobID sql.NullInt64
+}
+
+func unfinishedTreeTx(ctx context.Context, tx *sql.Tx, runID string, includeRoot bool) ([]runToCancel, error) {
 	rows, err := tx.QueryContext(ctx, `
 WITH RECURSIVE tree AS (
     SELECT id, 0 AS depth FROM pgworkflow_runs WHERE id = $1
@@ -309,41 +354,18 @@ WHERE (tree.depth > 0 OR $2)
 ORDER BY tree.depth
 FOR UPDATE OF run`, runID, includeRoot)
 	if err != nil {
-		return fmt.Errorf("workflow: lock runs to cancel: %w", err)
+		return nil, fmt.Errorf("workflow: lock runs to cancel: %w", err)
 	}
-	type cancelledRun struct {
-		id    string
-		jobID sql.NullInt64
-	}
-	var runs []cancelledRun
+	defer func() { _ = rows.Close() }()
+	var runs []runToCancel
 	for rows.Next() {
-		var run cancelledRun
+		var run runToCancel
 		if err := rows.Scan(&run.id, &run.jobID); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("workflow: scan run to cancel: %w", err)
+			return nil, fmt.Errorf("workflow: scan run to cancel: %w", err)
 		}
 		runs = append(runs, run)
 	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, run := range runs {
-		if _, err := tx.ExecContext(ctx, `
-UPDATE pgworkflow_runs
-SET status = 'cancelled', error = 'cancelled', completed_at = NOW(), wake_at = NULL, updated_at = NOW()
-WHERE id = $1`, run.id); err != nil {
-			return fmt.Errorf("workflow: cancel run: %w", err)
-		}
-		if run.jobID.Valid {
-			if err := c.queue.WakeTx(ctx, tx, run.jobID.Int64); err != nil {
-				return err
-			}
-		}
-		if err := c.queue.NotifyTx(ctx, tx, runNotifyKey(run.id)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return runs, rows.Err()
 }
 
 // Retry resumes a failed or cancelled run from its checkpoints: completed steps keep

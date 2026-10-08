@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS pgworkflow_runs (
 CREATE UNIQUE INDEX IF NOT EXISTS pgworkflow_runs_key ON pgworkflow_runs (workflow, key) WHERE key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS pgworkflow_runs_by_workflow ON pgworkflow_runs (workflow, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS pgworkflow_runs_by_status ON pgworkflow_runs (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS pgworkflow_runs_newest ON pgworkflow_runs (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS pgworkflow_runs_by_job ON pgworkflow_runs (job_id) WHERE status IN ('pending', 'running', 'waiting');
 CREATE INDEX IF NOT EXISTS pgworkflow_runs_by_parent ON pgworkflow_runs (parent_run_id) WHERE parent_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS pgworkflow_runs_finished ON pgworkflow_runs (completed_at) WHERE completed_at IS NOT NULL;
 
@@ -91,7 +93,7 @@ CREATE TABLE IF NOT EXISTS pgworkflow_signals (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS pgworkflow_signals_waiting ON pgworkflow_signals (run_id, name, id) WHERE received_by IS NULL;
+CREATE INDEX IF NOT EXISTS pgworkflow_signals_by_run ON pgworkflow_signals (run_id, name, id);
 `
 
 func jsonUnmarshal(raw json.RawMessage, target any) error {

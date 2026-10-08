@@ -7,18 +7,23 @@ import (
 	"time"
 )
 
-// SnoozeTx returns a processing job to pending, claimable again at until, without
-// spending the attempt its claim used. A zero until parks the job until WakeTx makes
-// it due; a past until makes it due now. Use database time for until, as the claim
-// query compares it with NOW().
-func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, id int64, until time.Time) error {
+// ParkedUntil is the availability of a job snoozed with a zero time: it waits
+// until WakeTx makes it due.
+var ParkedUntil = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
+
+// SnoozeTx returns the job a handler holds to pending, claimable again at until,
+// without spending the attempt its claim used. A zero until parks the job until
+// WakeTx makes it due; a past until makes it due now. Use database time for until,
+// as the claim query compares it with NOW(). Like Heartbeat it acts only on the
+// claim job describes, and returns ErrJobNotFound once that claim is gone.
+func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, job Job, until time.Time) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
 	if tx == nil {
 		return fmt.Errorf("pgqueue: tx is nil")
 	}
-	var availableAt any
+	availableAt := ParkedUntil
 	if !until.IsZero() {
 		availableAt = until.UTC()
 	}
@@ -28,25 +33,25 @@ func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, id int64, until time.
 			UPDATE pgqueue_jobs
 			SET status = 'pending',
 			    attempts = GREATEST(attempts - 1, 0),
-			    available_at = GREATEST(COALESCE($2::timestamptz, 'infinity'), NOW()),
+			    available_at = GREATEST($2::timestamptz, NOW()),
 			    claimed_by = NULL,
 			    claimed_at = NULL,
 			    updated_at = NOW()
-			WHERE id = $1 AND status = 'processing'
+			WHERE id = $1 AND status = 'processing' AND attempts = $3
 			RETURNING queue_name, available_at <= NOW() AS due
 		 ), notified AS (
 			SELECT `+notifySQL("snoozed")+` FROM snoozed WHERE snoozed.due
 		 )
 		 SELECT (SELECT count(*) FROM snoozed), (SELECT count(*) FROM notified)`,
-		id, availableAt,
+		job.ID, availableAt, job.Attempts,
 	).Scan(&snoozed, &notified)
 	if err != nil {
 		return fmt.Errorf("pgqueue: snooze: %w", err)
 	}
 	if snoozed == 0 {
-		return fmt.Errorf("pgqueue: snooze id=%d: %w", id, ErrJobNotFound)
+		return fmt.Errorf("pgqueue: snooze id=%d: %w", job.ID, ErrJobNotFound)
 	}
-	c.emit(ctx, EventRetry, map[string]any{"id": id, "snooze": true})
+	c.emit(ctx, EventRetry, map[string]any{"id": job.ID, "snooze": true})
 	return nil
 }
 
