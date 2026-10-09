@@ -37,11 +37,12 @@ type Options struct {
 	Workflows []workflow.Definition
 }
 
-// Module provides a *workflow.Client and, with StartWorker, runs a worker.
+// Module provides a *workflow.Client and, with StartWorker, runs a worker. Workflow
+// definitions may depend on the client, as a service that starts its own runs does.
 func Module(opts Options) fx.Option {
 	return fx.Module("pgkit.workflow",
-		fx.Provide(func(p Params) (*workflow.Client, error) {
-			return workflow.New(p.Queue)
+		fx.Provide(func(q *qpkg.Client) (*workflow.Client, error) {
+			return workflow.New(q)
 		}),
 		fx.Invoke(func(lc fx.Lifecycle, client *workflow.Client, p Params) error {
 			if opts.EnsureSchema {
