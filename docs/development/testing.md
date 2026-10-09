@@ -10,7 +10,7 @@ go build ./...
 
 Select affected packages for iteration: `go test -race -count=1 ./queue ./workflow`, `./pglock`, `./pgcron` or `./adminui`. The lock, queue, scheduling, workflow and admin tests use real PostgreSQL through testcontainers; fake database tests are insufficient evidence for locking and concurrent state changes.
 
-For frontend changes, run the commands in [setup](setup.md), regenerate embedded assets, then test `./adminui` and the playground. Verify dashboard auth, mutation disabling and CSRF when touching those paths. Queue changes must cover transitions, retries, claim exclusivity, claim fencing and restart recovery.
+For frontend changes, run `check`, `lint` and `build` from [setup](setup.md), regenerate embedded assets, then test `./adminui` and the playground. Review the changed screens with the worst-case fixtures (`?data=worst` in `pnpm dev`) and against the playground at phone (390 px), tablet (820 px) and desktop widths in light and dark themes, including keyboard navigation and replay, delete, enqueue, retry and cancel. Verify dashboard auth, mutation disabling and CSRF when touching those paths; API changes need `./adminui` tests against PostgreSQL. Queue changes must cover transitions, retries, claim exclusivity, claim fencing and restart recovery.
 
 ## Workflow suite
 
