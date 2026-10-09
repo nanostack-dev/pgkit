@@ -11,13 +11,10 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/nanostack-dev/pgkit/internal/testdb"
 )
 
 // ---------------------------------------------------------------------------
@@ -1278,68 +1275,5 @@ func (e errSample) Error() string { return string(e) }
 // createTestDB spins up a Postgres container and returns a connected *sql.DB.
 func createTestDB(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
-
-	pg, connString := startPostgres(t, ctx)
-	t.Cleanup(func() {
-		_ = pg.Terminate(ctx)
-	})
-
-	db, err := sql.Open("pgx", connString)
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := waitForPing(ctx, db, 20*time.Second); err != nil {
-		t.Fatalf("db ping: %v", err)
-	}
-
-	return db
+	return testdb.Open(t, ctx, "pgkit_test")
 }
-
-func startPostgres(t *testing.T, ctx context.Context) (testcontainers.Container, string) {
-	t.Helper()
-
-	pg, err := postgres.Run(
-		ctx,
-		"postgres:16-alpine",
-		postgres.WithDatabase("pgkit_test"),
-		postgres.WithUsername("pgkit"),
-		postgres.WithPassword("pgkit"),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-
-	connString, err := pg.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = pg.Terminate(ctx)
-		t.Fatalf("postgres connection string: %v", err)
-	}
-
-	return pg, connString
-}
-
-func waitForPing(ctx context.Context, db *sql.DB, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-
-	for time.Now().Before(deadline) {
-		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		err := db.PingContext(pingCtx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		time.Sleep(250 * time.Millisecond)
-	}
-
-	return lastErr
-}
-
-// Ensure unused imports don't cause issues
-var _ = atomic.Int32{}

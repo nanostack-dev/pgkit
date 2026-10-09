@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nanostack-dev/pgkit/internal/testdb"
 	"github.com/testcontainers/testcontainers-go"
 )
 
@@ -36,11 +37,17 @@ func sharedQueue(t *testing.T) *Client {
 	t.Helper()
 	ctx := context.Background()
 	shared.once.Do(func() {
-		container, connString := startWorkerPostgres(t, ctx)
+		container, connString, err := testdb.Start(ctx, "pgkit_worker_test")
+		if err != nil {
+			shared.err = err
+			return
+		}
 		shared.container = container
 		shared.db, shared.err = sql.Open("pgx", connString)
 		if shared.err == nil {
-			shared.err = waitWorkerPing(ctx, shared.db, 20*time.Second)
+			pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			shared.err = shared.db.PingContext(pingCtx)
+			cancel()
 		}
 		if shared.err == nil {
 			var q *Client

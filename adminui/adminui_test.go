@@ -10,11 +10,9 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/nanostack-dev/pgkit/internal/testdb"
 	qpkg "github.com/nanostack-dev/pgkit/queue"
 	"github.com/nanostack-dev/pgkit/workflow"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 func TestAdminUISnapshotAndWorkflowRun(t *testing.T) {
@@ -260,61 +258,6 @@ func TestAdminUIRequiresAuthAndSupportsMutations(t *testing.T) {
 	}
 }
 
-func createTestDB(t *testing.T, ctx context.Context) *sql.DB {
-	t.Helper()
-	pg, connString := startPostgres(t, ctx)
-	t.Cleanup(func() {
-		_ = pg.Terminate(ctx)
-	})
-	db, err := sql.Open("pgx", connString)
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-	if err := waitForPing(ctx, db, 20*time.Second); err != nil {
-		t.Fatalf("db ping: %v", err)
-	}
-	return db
-}
-
-func startPostgres(t *testing.T, ctx context.Context) (testcontainers.Container, string) {
-	t.Helper()
-	pg, err := postgres.Run(
-		ctx,
-		"postgres:16-alpine",
-		postgres.WithDatabase("pgkit_test"),
-		postgres.WithUsername("pgkit"),
-		postgres.WithPassword("pgkit"),
-	)
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
-	}
-	connString, err := pg.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = pg.Terminate(ctx)
-		t.Fatalf("postgres connection string: %v", err)
-	}
-	return pg, connString
-}
-
-func waitForPing(ctx context.Context, db *sql.DB, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		pingCtx, cancel := context.WithTimeout(ctx, time.Second)
-		err := db.PingContext(pingCtx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return err
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-}
-
 func requireEventually(t *testing.T, timeout, interval time.Duration, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -395,4 +338,9 @@ func TestAdminUIHidesServerErrorDetails(t *testing.T) {
 			t.Fatalf("%s leaked %q", path, body["error"])
 		}
 	}
+}
+
+func createTestDB(t *testing.T, ctx context.Context) *sql.DB {
+	t.Helper()
+	return testdb.Open(t, ctx, "pgkit_test")
 }

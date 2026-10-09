@@ -24,3 +24,10 @@ The workflow tests share one PostgreSQL container per test binary and clone a fr
 Timing-sensitive tests keep margins of several heartbeats: on a loaded machine a sub-second visibility timeout lets the reaper take over a run whose heartbeats are merely late.
 
 Documentation-only changes need local link checks and `git diff --check`; they do not require creating runtime tests. Report skipped database checks separately from passing ones.
+
+`internal/testdb.Open` owns disposable PostgreSQL containers for lock, queue,
+worker and admin API tests. It keeps each caller's database name, waits for
+PostgreSQL readiness, and registers pool/container cleanup even when a later
+setup step fails. Startup honors the caller context; cleanup has its own bounded
+context so cancellation cannot leak the container. Workflow tests keep their
+specialized shared server and migrated template cloning for parallel isolation.
