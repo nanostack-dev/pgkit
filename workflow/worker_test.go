@@ -191,11 +191,14 @@ func TestHeartbeatsKeepALongStepOnItsWorker(t *testing.T) {
 	h.startWorkerWith(workerOptions{config: WorkerConfig{VisibilityTimeout: 600 * time.Millisecond, ReapInterval: time.Hour}}, flow)
 	run := mustStart(h, flow, struct{}{})
 	long.awaitReached(t)
-	claimedAt := h.jobClaimedAt(run.ID)
+	h.exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - interval '1 hour' WHERE id = (SELECT job_id FROM pgworkflow_runs WHERE id = $1)`, run.ID)
 
-	h.eventually("a heartbeat renews the claim", func() bool { return h.jobClaimedAt(run.ID).After(claimedAt) })
-	if _, err := h.queue.Reap(h.ctx, queue.ReapParams{VisibilityTimeout: 600 * time.Millisecond, QueueNames: []string{flow.definition.queueName()}}); err != nil {
-		t.Fatal(err)
+	h.eventually("a heartbeat renews the claim", func() bool {
+		return h.queryInt(`SELECT count(*) FROM pgqueue_jobs WHERE id = (SELECT job_id FROM pgworkflow_runs WHERE id = $1) AND claimed_at > NOW() - interval '1 minute'`, run.ID) == 1
+	})
+	reaped, err := h.queue.Reap(h.ctx, queue.ReapParams{VisibilityTimeout: 30 * time.Second, QueueNames: []string{flow.definition.queueName()}})
+	if err != nil || reaped.Requeued+reaped.Failed != 0 {
+		t.Fatalf("reap = %+v, err = %v, want the renewed claim spared", reaped, err)
 	}
 	long.release()
 
@@ -205,15 +208,6 @@ func TestHeartbeatsKeepALongStepOnItsWorker(t *testing.T) {
 	if calls.get("long") != 1 {
 		t.Fatalf("the long step ran %d times", calls.get("long"))
 	}
-}
-
-func (h *harness) jobClaimedAt(runID string) time.Time {
-	h.t.Helper()
-	var at sql.NullTime
-	if err := h.db.QueryRowContext(h.ctx, `SELECT j.claimed_at FROM pgqueue_jobs j JOIN pgworkflow_runs r ON r.job_id = j.id WHERE r.id = $1`, runID).Scan(&at); err != nil {
-		h.t.Fatalf("claimed at: %v", err)
-	}
-	return at.Time
 }
 
 func TestAnActivationThatLostItsClaimStops(t *testing.T) {
@@ -231,7 +225,7 @@ func TestAnActivationThatLostItsClaimStops(t *testing.T) {
 	run := mustStart(h, flow, struct{}{})
 	reached.awaitReached(t)
 
-	h.exec(`UPDATE pgqueue_jobs SET attempts = attempts + 1 WHERE id = (SELECT job_id FROM pgworkflow_runs WHERE id = $1)`, run.ID)
+	h.exec(`UPDATE pgqueue_jobs SET claims = claims + 1 WHERE id = (SELECT job_id FROM pgworkflow_runs WHERE id = $1)`, run.ID)
 
 	select {
 	case cause := <-causes:

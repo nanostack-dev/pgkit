@@ -257,7 +257,10 @@ func TestATxStepWhoseCheckpointFailsKeepsNoWrites(t *testing.T) {
 	})
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
-	h.eventually("the step was attempted", func() bool { return calls.get("record") >= 1 })
+	h.eventually("the refused checkpoint failed the activation", func() bool {
+		return h.queryInt(`SELECT count(*) FROM pgqueue_jobs job JOIN pgworkflow_runs run ON run.job_id = job.id
+			WHERE run.id = $1 AND job.status = 'pending' AND job.last_error LIKE '%checkpoint refused%'`, run.ID) == 1
+	})
 
 	if h.queryInt(`SELECT count(*) FROM ledger`) != 0 {
 		t.Fatal("the write committed without its checkpoint")
@@ -268,6 +271,9 @@ func TestATxStepWhoseCheckpointFailsKeepsNoWrites(t *testing.T) {
 	mustResult(h, run)
 	if h.queryInt(`SELECT count(*) FROM ledger`) != 1 {
 		t.Fatalf("ledger entries = %d, want exactly one", h.queryInt(`SELECT count(*) FROM ledger`))
+	}
+	if calls.get("record") < 2 {
+		t.Fatal("the step did not run again after its checkpoint was refused")
 	}
 }
 

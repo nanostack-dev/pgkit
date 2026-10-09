@@ -93,8 +93,8 @@ type ListRunsParams struct {
 	Offset      int
 }
 
-// PurgeParams selects finished runs to delete: those completed more than OlderThan
-// ago, at most Limit of them when Limit is positive.
+// PurgeParams selects the finished run trees Purge deletes: those whose top-level
+// run completed more than OlderThan ago, at most Limit trees when Limit is positive.
 type PurgeParams struct {
 	OlderThan time.Duration
 	Limit     int

@@ -289,6 +289,43 @@ func TestATimedOutReceiveStaysTimedOutOnReplay(t *testing.T) {
 	}
 }
 
+func TestASignalSentAfterTheDeadlineByAnOlderTransactionIsLate(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("late-in-tx", func(wf *Context, _ struct{}) (string, error) {
+		_, err := wf.Receive(approved, time.Hour)
+		if errors.Is(err, ErrTimeout) {
+			return "expired", nil
+		}
+		return "approved", err
+	})
+	stop := h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+	h.waitForStatus(run.ID, RunWaiting)
+	stop()
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(h.ctx, `SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	h.exec(`UPDATE pgworkflow_steps SET wake_at = clock_timestamp() WHERE run_id = $1 AND name = 'approved'`, run.ID)
+
+	if err := h.client.SignalTx(h.ctx, tx, run.ID, approved, approval{By: "late"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	h.wakeJob(run.ID)
+	h.startWorker(flow)
+
+	if got := mustResult(h, run); got != "expired" {
+		t.Fatalf("a signal sent after the deadline was received: %q", got)
+	}
+}
+
 func TestReceiveWithAZeroTimeoutChecksOnce(t *testing.T) {
 	h := newHarness(t)
 	flow := Define("poll-once", func(wf *Context, _ struct{}) (bool, error) {

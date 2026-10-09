@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -134,37 +135,105 @@ func (c *Client) CountRuns(ctx context.Context, params ListRunsParams) (int64, e
 // top-level run finished more than params.OlderThan ago and every run of the tree is
 // finished. Their checkpoints and signals go with them. Limit, when positive,
 // bounds the number of trees. Children are never purged apart from their parent, so
-// retrying a retained parent finds them. Run Purge periodically to bound the
-// tables; the queue's own Purge removes finished jobs.
+// retrying a retained parent finds them. It returns the number of runs deleted. Run
+// Purge periodically to bound the tables; the queue's own Purge removes finished
+// jobs.
+//
+// Purge locks the trees it picked from the top down, the order Retry and Cancel
+// follow, then deletes those still purgeable: a tree retried meanwhile is kept.
 func (c *Client) Purge(ctx context.Context, params PurgeParams) (int64, error) {
 	var limit any
 	if params.Limit > 0 {
 		limit = params.Limit
 	}
-	res, err := c.db.ExecContext(ctx, `
-WITH RECURSIVE roots AS (
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("workflow: begin purge: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, purgeableTreesSQL(`
     SELECT root.id FROM pgworkflow_runs root
     WHERE root.status IN ('succeeded', 'failed', 'cancelled')
       AND root.completed_at < NOW() - make_interval(secs => $1)
       AND NOT EXISTS (SELECT 1 FROM pgworkflow_runs parent WHERE parent.id = root.parent_run_id)
+`)+`, chosen AS (
+    SELECT purgeable.root_id FROM purgeable
+    JOIN pgworkflow_runs root ON root.id = purgeable.root_id
     ORDER BY root.completed_at
+    LIMIT $2
+)
+SELECT tree.root_id FROM tree
+JOIN chosen ON chosen.root_id = tree.root_id
+JOIN pgworkflow_runs run ON run.id = tree.id
+ORDER BY tree.root_id, tree.depth
+FOR UPDATE OF run`, max(params.OlderThan, 0).Seconds(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("workflow: lock runs to purge: %w", err)
+	}
+	roots, err := distinctStrings(rows)
+	if err != nil {
+		return 0, fmt.Errorf("workflow: lock runs to purge: %w", err)
+	}
+	if len(roots) == 0 {
+		return 0, nil
+	}
+	encodedRoots, err := json.Marshal(roots)
+	if err != nil {
+		return 0, fmt.Errorf("workflow: encode runs to purge: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, purgeableTreesSQL(`
+    SELECT root.id FROM pgworkflow_runs root
+    WHERE root.id IN (SELECT jsonb_array_elements_text($2::jsonb))
+      AND root.status IN ('succeeded', 'failed', 'cancelled')
+      AND root.completed_at < NOW() - make_interval(secs => $1)`)+`
+DELETE FROM pgworkflow_runs
+WHERE id IN (SELECT tree.id FROM tree JOIN purgeable ON purgeable.root_id = tree.root_id)`,
+		max(params.OlderThan, 0).Seconds(), string(encodedRoots))
+	if err != nil {
+		return 0, fmt.Errorf("workflow: purge runs: %w", err)
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("workflow: purge runs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("workflow: commit purge: %w", err)
+	}
+	return deleted, nil
+}
+
+// purgeableTreesSQL opens a query with the trees below the roots selects and
+// purgeable, the roots of trees whose runs are all finished.
+func purgeableTreesSQL(roots string) string {
+	return `
+WITH RECURSIVE roots AS (` + roots + `
 ), tree AS (
-    SELECT id AS root_id, id FROM roots
+    SELECT id AS root_id, id, 0 AS depth FROM roots
     UNION ALL
-    SELECT tree.root_id, child.id FROM pgworkflow_runs child JOIN tree ON child.parent_run_id = tree.id
+    SELECT tree.root_id, child.id, tree.depth + 1
+    FROM pgworkflow_runs child JOIN tree ON child.parent_run_id = tree.id
 ), purgeable AS (
     SELECT root_id FROM tree JOIN pgworkflow_runs run ON run.id = tree.id
     GROUP BY root_id
     HAVING bool_and(run.status IN ('succeeded', 'failed', 'cancelled'))
-    LIMIT $2
-)
-DELETE FROM pgworkflow_runs
-WHERE id IN (SELECT tree.id FROM tree JOIN purgeable ON purgeable.root_id = tree.root_id)`,
-		max(params.OlderThan, 0).Seconds(), limit)
-	if err != nil {
-		return 0, fmt.Errorf("workflow: purge runs: %w", err)
+)`
+}
+
+func distinctStrings(rows *sql.Rows) ([]string, error) {
+	defer func() { _ = rows.Close() }()
+	var values []string
+	seen := map[string]bool{}
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		if !seen[value] {
+			seen[value] = true
+			values = append(values, value)
+		}
 	}
-	return res.RowsAffected()
+	return values, rows.Err()
 }
 
 // Run is a typed handle on a run, returned by Client.Start, Client.Run and

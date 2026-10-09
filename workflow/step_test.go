@@ -236,15 +236,18 @@ func TestAShortBackoffRetriesWithoutSuspendingTheRun(t *testing.T) {
 func TestATimeoutBoundsEachAttempt(t *testing.T) {
 	h := newHarness(t)
 	calls := newCounter()
-	secondAttempt := make(chan string, 1)
+	deadlines := make(chan time.Time, 2)
 	flow := Define("slow", func(wf *Context, _ struct{}) (string, error) {
 		return wf.Step("call-api", func(ctx context.Context) (string, error) {
+			deadline, hasDeadline := ctx.Deadline()
+			if !hasDeadline || time.Until(deadline) > 100*time.Millisecond {
+				return "", NonRetryable(fmt.Errorf("attempt deadline %v is not within the step timeout", deadline))
+			}
+			deadlines <- deadline
 			if calls.add("call-api") == 1 {
 				<-ctx.Done()
 				return "", ctx.Err()
 			}
-			deadline, hasDeadline := ctx.Deadline()
-			secondAttempt <- fmt.Sprintf("err=%v deadline=%v remaining>40ms=%v", ctx.Err(), hasDeadline, time.Until(deadline) > 40*time.Millisecond)
 			return "fast enough", nil
 		}, Timeout(100*time.Millisecond), fastRetry)
 	})
@@ -254,8 +257,8 @@ func TestATimeoutBoundsEachAttempt(t *testing.T) {
 	if got := mustResult(h, run); got != "fast enough" {
 		t.Fatalf("result = %q", got)
 	}
-	if got := <-secondAttempt; got != "err=<nil> deadline=true remaining>40ms=true" {
-		t.Fatalf("the second attempt did not get a fresh bounded context: %s", got)
+	if first, second := <-deadlines, <-deadlines; !second.After(first) {
+		t.Fatalf("the second attempt reused the first one's deadline %v", first)
 	}
 	h.requireStep(run.ID, "call-api", StepSucceeded, 2)
 }

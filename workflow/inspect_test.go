@@ -282,3 +282,37 @@ func TestPurgeDeletesWholeTreesAndKeepsChildrenOfRetainedParents(t *testing.T) {
 		t.Fatalf("purged %d runs (err %v), want the parent and its child", deleted, err)
 	}
 }
+
+func TestPurgeKeepsATreeRetriedWhileItWaited(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("purge-retried", func(wf *Context, _ struct{}) (int, error) { return 0, errors.New("boom") })
+	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+	awaitFailure(h, run)
+	h.exec(`UPDATE pgworkflow_runs SET completed_at = NOW() - interval '8 days' WHERE id = $1`, run.ID)
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := h.client.retryTx(h.ctx, tx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	purged := make(chan error, 1)
+	var deleted int64
+	go func() {
+		var err error
+		deleted, err = h.client.Purge(h.ctx, PurgeParams{OlderThan: 7 * 24 * time.Hour})
+		purged <- err
+	}()
+	h.waitForLockWaiters(1)
+
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-purged; err != nil || deleted != 0 {
+		t.Fatalf("purged %d runs (err %v) of a tree retried while Purge waited", deleted, err)
+	}
+	h.run(run.ID)
+}

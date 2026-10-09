@@ -49,7 +49,7 @@ const maxSearchLength = 256
 
 // schemaVersion is the current version of the pgqueue schema.
 // Bump this when adding migrations.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Job represents a single queue job row.
 type Job struct {
@@ -59,6 +59,9 @@ type Job struct {
 	Status      JobStatus
 	Attempts    int
 	MaxAttempts int
+	// Claims counts every claim of the job, replays included, so it identifies the
+	// claim a handler holds: Heartbeat, LockClaimTx and SnoozeTx check it.
+	Claims      int
 	AvailableAt time.Time
 	ClaimedBy   sql.NullString
 	ClaimedAt   sql.NullTime
@@ -293,6 +296,11 @@ CREATE TABLE IF NOT EXISTS pgqueue_meta (
 			return err
 		}
 	}
+	if currentVersion < 2 {
+		if err := c.migrateV2(ctx); err != nil {
+			return err
+		}
+	}
 
 	// Upsert version.
 	if _, err := c.db.ExecContext(ctx, `
@@ -335,6 +343,15 @@ WHERE status = 'processing';
 `)
 	if err != nil {
 		return fmt.Errorf("pgqueue: migrate v1: %w", err)
+	}
+	return nil
+}
+
+// migrateV2 adds the claim counter that fences handlers. Unlike attempts, which
+// a replay resets and a snooze refunds, it only grows.
+func (c *Client) migrateV2(ctx context.Context) error {
+	if _, err := c.db.ExecContext(ctx, `ALTER TABLE pgqueue_jobs ADD COLUMN IF NOT EXISTS claims INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("pgqueue: migrate v2: %w", err)
 	}
 	return nil
 }
@@ -450,19 +467,20 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 		 UPDATE pgqueue_jobs j
 		 SET status = 'processing',
 		     attempts = attempts + 1,
+		     claims = claims + 1,
 		     claimed_by = $2,
 		     claimed_at = NOW(),
 		     updated_at = NOW()
 		 FROM next_job
 		 WHERE j.id = next_job.id
-		 RETURNING j.id, j.queue_name, j.payload, j.status, j.attempts, j.max_attempts, j.available_at,
+		 RETURNING j.id, j.queue_name, j.payload, j.status, j.attempts, j.max_attempts, j.claims, j.available_at,
 		           j.claimed_by, j.claimed_at, j.done_at, j.last_error, j.created_at, j.updated_at`,
 		queueName, worker,
 	)
 
 	j := &Job{}
 	scanErr := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
+		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
 		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
 		&j.CreatedAt, &j.UpdatedAt,
 	)
@@ -749,7 +767,7 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	}
 
 	// Build query dynamically based on optional filters.
-	query := `SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
+	query := `SELECT id, queue_name, payload, status, attempts, max_attempts, claims, available_at,
 	                 claimed_by, claimed_at, done_at, last_error, created_at, updated_at
 	          FROM pgqueue_jobs WHERE 1=1`
 	args := make([]any, 0, 4)
@@ -796,7 +814,7 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	for rows.Next() {
 		var j Job
 		if err := rows.Scan(
-			&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
+			&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
 			&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
 			&j.CreatedAt, &j.UpdatedAt,
 		); err != nil {
@@ -860,7 +878,7 @@ func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
 	}
 
 	row := c.db.QueryRowContext(ctx,
-		`SELECT id, queue_name, payload, status, attempts, max_attempts, available_at,
+		`SELECT id, queue_name, payload, status, attempts, max_attempts, claims, available_at,
                 claimed_by, claimed_at, done_at, last_error, created_at, updated_at
          FROM pgqueue_jobs WHERE id = $1`,
 		id,
@@ -868,7 +886,7 @@ func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
 
 	var j Job
 	if err := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts,
+		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
 		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
 		&j.CreatedAt, &j.UpdatedAt,
 	); err != nil {

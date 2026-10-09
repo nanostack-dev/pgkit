@@ -128,11 +128,12 @@ err = client.WakeTx(ctx, tx, jobID)                // a parked or delayed job be
 ```
 
 `Heartbeat`, `LockClaimTx` and `SnoozeTx` act only on the claim described by
-`job`, its ID and attempt number, so a handler whose job was reaped and claimed
-elsewhere cannot touch the new claim. Attempt numbers only grow: instead of
-refunding the attempt, `SnoozeTx` raises the job's `MaxAttempts` by one. Durations
-and timeouts keep sub-second precision; `Reap` refuses a non-positive visibility
-timeout.
+`job`, its ID and claim number (`Job.Claims`), so a handler whose job was reaped,
+or failed and replayed, and claimed elsewhere cannot touch the new claim. The claim
+number counts every claim and only grows; `attempts` stays the retry budget, which
+`SnoozeTx` refunds and a replay resets. Durations and timeouts keep sub-second
+precision; `Reap` refuses a non-positive visibility timeout. `EnsureSchema` adds
+the `claims` column to existing queues (schema version 2).
 
 `client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
 `LISTEN` connection for other keys: a subscription wakes when a notification for

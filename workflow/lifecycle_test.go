@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -135,35 +136,55 @@ func TestARunThatOutlivesItsTimeoutFails(t *testing.T) {
 
 func TestARunTimeoutInterruptsTheRunningStep(t *testing.T) {
 	h := newHarness(t)
-	reached := newGate()
-	flow := Define("stuck", func(wf *Context, _ struct{}) (string, error) {
-		return wf.Step("hang", func(ctx context.Context) (string, error) {
-			return "", reached.wait(ctx)
+	entered := newCounter()
+	flow := Define("stuck", func(wf *Context, round int) (int, error) {
+		return wf.Step("hang", func(ctx context.Context) (int, error) {
+			entered.add(strconv.Itoa(round))
+			<-ctx.Done()
+			return 0, ctx.Err()
 		})
 	})
 	h.startWorker(flow)
-	run := mustStart(h, flow, struct{}{}, Timeout(3*time.Second))
-	reached.awaitReached(t)
 
-	_, err := result(h, run)
+	run := timeOutDuringAStep(h, flow, entered)
 
-	requireErrorIs(t, err, ErrTimeout)
+	if step := h.step(run.ID, "hang"); step.Status == StepSucceeded {
+		t.Fatalf("the interrupted step succeeded: %+v", step)
+	}
 }
 
 func TestARunPastItsTimeoutFailsEvenWhenItsStepIgnoresTheContext(t *testing.T) {
 	h := newHarness(t)
-	flow := Define("overrun", func(wf *Context, _ struct{}) (int, error) {
+	entered := newCounter()
+	flow := Define("overrun", func(wf *Context, round int) (int, error) {
 		return wf.Step("stubborn", func(ctx context.Context) (int, error) {
+			entered.add(strconv.Itoa(round))
 			<-ctx.Done()
 			return 1, nil
 		})
 	})
 	h.startWorker(flow)
-	run := mustStart(h, flow, struct{}{}, Timeout(300*time.Millisecond))
 
-	_, err := result(h, run)
+	run := timeOutDuringAStep(h, flow, entered)
 
-	requireErrorIs(t, err, ErrTimeout)
+	h.requireStep(run.ID, "stubborn", StepSucceeded, 1)
+}
+
+// timeOutDuringAStep starts runs of flow until one times out after its step began,
+// as entered records by round. A run picked up after its deadline fails before its
+// step and proves nothing, so the next round tries again.
+func timeOutDuringAStep(h *harness, flow *Workflow[int, int], entered *counter) Run[int] {
+	h.t.Helper()
+	for round := 1; round <= 3; round++ {
+		run := mustStart(h, flow, round, Timeout(500*time.Millisecond))
+		_, err := result(h, run)
+		requireErrorIs(h.t, err, ErrTimeout)
+		if entered.get(strconv.Itoa(round)) > 0 {
+			return run
+		}
+	}
+	h.t.Fatal("no run reached its step before its deadline")
+	return Run[int]{}
 }
 
 func TestARunWhoseTimeoutPassedBeforeItStartedFails(t *testing.T) {

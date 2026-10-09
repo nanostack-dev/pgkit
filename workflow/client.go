@@ -200,8 +200,10 @@ func (c *Client) SignalTx[T any](ctx context.Context, tx *sql.Tx, runID string, 
 	if status.Finished() {
 		return fmt.Errorf("%w: %s is %s", ErrRunFinished, runID, status)
 	}
+	// clock_timestamp, not NOW(): a transaction begun before a receive's deadline
+	// must not backdate a signal sent after it.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO pgworkflow_signals (run_id, name, payload) VALUES ($1, $2, $3::jsonb)`,
+		`INSERT INTO pgworkflow_signals (run_id, name, payload, created_at) VALUES ($1, $2, $3::jsonb, clock_timestamp())`,
 		runID, signal.name, string(payload),
 	); err != nil {
 		return fmt.Errorf("workflow: insert signal: %w", err)

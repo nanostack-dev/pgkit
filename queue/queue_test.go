@@ -539,6 +539,34 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureSchemaUpgradesAVersionOneQueue(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+	q, err := New(db)
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE pgqueue_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create meta: %v", err)
+	}
+	if err := q.migrateV1(ctx); err != nil {
+		t.Fatalf("migrate v1: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO pgqueue_meta VALUES ('schema_version', '1');
+		INSERT INTO pgqueue_jobs (queue_name, payload) VALUES ('upgrade', '{}')`); err != nil {
+		t.Fatalf("seed v1: %v", err)
+	}
+
+	if err := q.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	job, found, err := q.Claim(ctx, "upgrade", "w")
+	if err != nil || !found || job.Claims != 1 {
+		t.Fatalf("claim after upgrade = %+v, found %v, err %v", job, found, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // P2 #11: Backoff helpers
 // ---------------------------------------------------------------------------

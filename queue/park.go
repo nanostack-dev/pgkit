@@ -13,9 +13,8 @@ import (
 var ParkedUntil = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
 
 // SnoozeTx returns the job a handler holds to pending, claimable again at until,
-// without counting the attempt against the job: it raises the job's MaxAttempts by
-// one, so attempt numbers keep increasing and keep identifying claims. A zero until
-// parks the job until WakeTx makes it due; a past until makes it due now. Use
+// and refunds the attempt, so a snooze never uses up the job's MaxAttempts. A zero
+// until parks the job until WakeTx makes it due; a past until makes it due now. Use
 // database time for until, as the claim query compares it with NOW(). Like
 // Heartbeat it acts only on the claim job describes, and returns ErrJobNotFound
 // once that claim is gone.
@@ -35,18 +34,18 @@ func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, job Job, until time.T
 		`WITH snoozed AS (
 			UPDATE pgqueue_jobs
 			SET status = 'pending',
-			    max_attempts = max_attempts + 1,
+			    attempts = GREATEST(attempts - 1, 0),
 			    available_at = GREATEST($2::timestamptz, NOW()),
 			    claimed_by = NULL,
 			    claimed_at = NULL,
 			    updated_at = NOW()
-			WHERE id = $1 AND status = 'processing' AND attempts = $3
+			WHERE id = $1 AND status = 'processing' AND claims = $3
 			RETURNING queue_name, available_at <= NOW() AS due
 		 ), notified AS (
 			SELECT `+notifySQL("snoozed")+` FROM snoozed WHERE snoozed.due
 		 )
 		 SELECT (SELECT count(*) FROM snoozed), (SELECT count(*) FROM notified)`,
-		job.ID, availableAt, job.Attempts,
+		job.ID, availableAt, job.Claims,
 	).Scan(&snoozed, &notified)
 	if err != nil {
 		return fmt.Errorf("pgqueue: snooze: %w", err)
@@ -98,8 +97,8 @@ func (c *Client) LockClaimTx(ctx context.Context, tx *sql.Tx, job Job) error {
 	}
 	var held bool
 	err := tx.QueryRowContext(ctx,
-		`SELECT TRUE FROM pgqueue_jobs WHERE id = $1 AND status = 'processing' AND attempts = $2 FOR UPDATE`,
-		job.ID, job.Attempts,
+		`SELECT TRUE FROM pgqueue_jobs WHERE id = $1 AND status = 'processing' AND claims = $2 FOR UPDATE`,
+		job.ID, job.Claims,
 	).Scan(&held)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("pgqueue: lock claim id=%d: %w", job.ID, ErrJobNotFound)
@@ -120,8 +119,8 @@ func (c *Client) Heartbeat(ctx context.Context, job Job) error {
 	res, err := c.db.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
 		 SET claimed_at = NOW(), updated_at = NOW()
-		 WHERE id = $1 AND status = 'processing' AND attempts = $2`,
-		job.ID, job.Attempts,
+		 WHERE id = $1 AND status = 'processing' AND claims = $2`,
+		job.ID, job.Claims,
 	)
 	if err != nil {
 		return fmt.Errorf("pgqueue: heartbeat: %w", err)

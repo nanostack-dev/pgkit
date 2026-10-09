@@ -348,13 +348,25 @@ func (h *harness) queryInt(query string, args ...any) int {
 // receive timeouts) due now and wakes its job, as if the time had passed.
 func (h *harness) fastForward(runID string) {
 	h.t.Helper()
-	h.exec(`UPDATE pgworkflow_steps SET wake_at = NOW() WHERE run_id = $1 AND wake_at > NOW()`, runID)
-	h.wakeJob(runID)
+	h.wakeRun(runID, true)
 }
 
 // wakeJob makes a parked run's job due now without changing what it waits for, so
 // the run replays and parks again unless something it waits for happened.
 func (h *harness) wakeJob(runID string) {
+	h.t.Helper()
+	h.wakeRun(runID, false)
+}
+
+// wakeRun waits until no activation of the run is in flight, as one could park
+// on the wake times it read before, then makes the job due while holding the run,
+// so an activation starting meanwhile reads the new wake times.
+func (h *harness) wakeRun(runID string, dueNow bool) {
+	h.t.Helper()
+	h.eventually("no activation of the run is in flight", func() bool { return h.tryWakeRun(runID, dueNow) })
+}
+
+func (h *harness) tryWakeRun(runID string, dueNow bool) bool {
 	h.t.Helper()
 	tx, err := h.db.BeginTx(h.ctx, nil)
 	if err != nil {
@@ -362,8 +374,19 @@ func (h *harness) wakeJob(runID string) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	var jobID int64
-	if err := tx.QueryRowContext(h.ctx, `SELECT job_id FROM pgworkflow_runs WHERE id = $1`, runID).Scan(&jobID); err != nil {
+	var jobStatus queue.JobStatus
+	if err := tx.QueryRowContext(h.ctx, `
+SELECT job.id, job.status FROM pgworkflow_runs run JOIN pgqueue_jobs job ON job.id = run.job_id
+WHERE run.id = $1 FOR UPDATE OF run`, runID).Scan(&jobID, &jobStatus); err != nil {
 		h.t.Fatalf("job of run: %v", err)
+	}
+	if jobStatus == queue.StatusProcessing {
+		return false
+	}
+	if dueNow {
+		if _, err := tx.ExecContext(h.ctx, `UPDATE pgworkflow_steps SET wake_at = NOW() WHERE run_id = $1 AND wake_at > NOW()`, runID); err != nil {
+			h.t.Fatalf("fast forward: %v", err)
+		}
 	}
 	if err := h.queue.WakeTx(h.ctx, tx, jobID); err != nil {
 		h.t.Fatalf("wake: %v", err)
@@ -371,6 +394,7 @@ func (h *harness) wakeJob(runID string) {
 	if err := tx.Commit(); err != nil {
 		h.t.Fatalf("commit: %v", err)
 	}
+	return true
 }
 
 func (h *harness) lease(runID string) int {

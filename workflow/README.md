@@ -91,7 +91,8 @@ that no longer decodes, fails the run with `ErrNonDeterministic`.
   by `Client.Signal` and `Context.Receive`. A signal sent before the run waits is
   kept; signals of one kind are received once each, in the order sent. A signal
   sent after a receive's timeout does not count for it, even if the run was still
-  parked. Pass `workflow.Forever` to wait without a timeout and `0` to check once.
+  parked; `SignalTx` dates a signal when it inserts it, not when its transaction
+  began. Pass `workflow.Forever` to wait without a timeout and `0` to check once.
 - **Children** run on whichever worker lists their workflow. Their key is the
   parent's run ID and step name, so a replay never starts them twice. Failing or
   cancelling a parent cancels its unfinished children.
@@ -166,7 +167,7 @@ err = client.Retry(ctx, runID)                          // resume a failed or ca
 info, err := client.GetRun(ctx, runID)
 steps, err := client.ListSteps(ctx, runID)
 runs, err := client.ListRuns(ctx, workflow.ListRunsParams{Status: workflow.RunFailed})
-deleted, err := client.Purge(ctx, workflow.PurgeParams{OlderThan: 30 * 24 * time.Hour}) // whole finished trees
+deleted, err := client.Purge(ctx, workflow.PurgeParams{OlderThan: 30 * 24 * time.Hour}) // whole finished trees, skipping any retried meanwhile
 ```
 
 `Retry` keeps completed checkpoints, starts failed and interrupted steps over with
@@ -253,7 +254,8 @@ key run and name) and `pgworkflow_signals`, created by `EnsureSchema`
   claim too. Every checkpoint write runs in a transaction that share-locks the
   run row and checks the lease and the `running` status ([activation.go](activation.go)),
   so a worker that lost the run cannot write, and a takeover waits for an in-flight
-  write. Snoozes are fenced by the job's attempt number.
+  write. Snoozes are fenced by the job's claim number, which a replay of the job
+  does not reset.
 - **One park point.** Operations that must wait record why and return
   `ErrSuspended`. When the function returns, the park transaction locks the run
   `FOR UPDATE` and re-checks every condition (unreceived signals, finished
