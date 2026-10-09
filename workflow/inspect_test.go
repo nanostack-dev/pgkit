@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -315,4 +317,78 @@ func TestPurgeKeepsATreeRetriedWhileItWaited(t *testing.T) {
 		t.Fatalf("purged %d runs (err %v) of a tree retried while Purge waited", deleted, err)
 	}
 	h.run(run.ID)
+}
+
+func TestPurgeKeepsATreeWhoseNewDescendantIsRetried(t *testing.T) {
+	h := newHarness(t)
+	// a-retried sorts first, so Purge waits on it before it locks r-tree.
+	h.insertFinishedRun("a-retried", "")
+	h.insertFinishedRun("r-tree", "")
+	h.insertFinishedRun("r-tree/child", "r-tree")
+	retryA := h.holdTx(`UPDATE pgworkflow_runs SET status = 'pending', completed_at = NULL WHERE id = 'a-retried'`)
+	purged := make(chan error, 1)
+	var deleted int64
+	go func() {
+		var err error
+		deleted, err = h.client.Purge(h.ctx, PurgeParams{OlderThan: 7 * 24 * time.Hour})
+		purged <- err
+	}()
+	h.waitForBlockedBy(retryA)
+
+	h.insertFinishedRun("r-tree/grandchild", "r-tree/child")
+	retryGrandchild := h.holdTx(`UPDATE pgworkflow_runs SET status = 'pending', completed_at = NULL WHERE id = 'r-tree/grandchild'`)
+	retryA.commit()
+	h.waitForBlockedBy(retryGrandchild)
+	retryGrandchild.commit()
+
+	if err := <-purged; err != nil || deleted != 0 {
+		t.Fatalf("purged %d runs (err %v) of trees retried while Purge waited", deleted, err)
+	}
+	if left := h.queryInt(`SELECT count(*) FROM pgworkflow_runs WHERE id LIKE 'r-tree%'`); left != 3 {
+		t.Fatalf("%d runs of r-tree left, want all 3", left)
+	}
+}
+
+func (h *harness) insertFinishedRun(id, parentID string) {
+	h.t.Helper()
+	h.exec(`INSERT INTO pgworkflow_runs (id, workflow, status, input, parent_run_id, completed_at)
+		VALUES ($1, 'synthetic', 'failed', '{}', NULLIF($2, ''), NOW() - interval '8 days')`, id, parentID)
+}
+
+type heldTx struct {
+	h   *harness
+	tx  *sql.Tx
+	pid int
+}
+
+// holdTx runs statement in a transaction it leaves open until commit.
+func (h *harness) holdTx(statement string) heldTx {
+	h.t.Helper()
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { _ = tx.Rollback() })
+	held := heldTx{h: h, tx: tx}
+	if err := tx.QueryRowContext(h.ctx, `SELECT pg_backend_pid()`).Scan(&held.pid); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(h.ctx, statement); err != nil {
+		h.t.Fatal(err)
+	}
+	return held
+}
+
+func (held heldTx) commit() {
+	held.h.t.Helper()
+	if err := held.tx.Commit(); err != nil {
+		held.h.t.Fatal(err)
+	}
+}
+
+func (h *harness) waitForBlockedBy(held heldTx) {
+	h.t.Helper()
+	h.eventually(fmt.Sprintf("a session waits for backend %d", held.pid), func() bool {
+		return h.queryInt(`SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, held.pid) > 0
+	})
 }

@@ -368,8 +368,7 @@ func TestSubscribeRefusesDriversWithoutNotifications(t *testing.T) {
 
 func TestReapHonorsASubSecondVisibilityTimeout(t *testing.T) {
 	q := sharedQueue(t)
-	const visibility = 900 * time.Millisecond
-	reap := func(job *Job) JobStatus {
+	reap := func(job *Job, visibility time.Duration) JobStatus {
 		t.Helper()
 		if _, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: visibility, QueueNames: []string{job.QueueName}}); err != nil {
 			t.Fatalf("reap: %v", err)
@@ -380,29 +379,28 @@ func TestReapHonorsASubSecondVisibilityTimeout(t *testing.T) {
 		}
 		return reaped.Status
 	}
-
-	// A claim younger than the timeout survives, which only shows while the reap runs
-	// within the timeout of the aging: a slower round proves nothing and is retried.
-	for round := 1; ; round++ {
-		job := enqueueAndClaim(t, q, fmt.Sprintf("%s-%d", uniqueQueueName(t), round), 3)
-		started := time.Now()
-		ageClaim(t, q, job.ID, "10 milliseconds")
-		status := reap(job)
-		if time.Since(started) < visibility-100*time.Millisecond {
-			if status != StatusProcessing {
-				t.Fatalf("a claim 10ms old was reaped with a 900ms visibility timeout: %s", status)
+	// Each check only tells a sub-second timeout from a truncated or rounded one
+	// while the reap runs soon enough after the aging: a slower round proves nothing
+	// and is retried.
+	conclusive := func(name, age string, visibility, within time.Duration, want JobStatus) {
+		t.Helper()
+		for round := 1; round <= 3; round++ {
+			job := enqueueAndClaim(t, q, fmt.Sprintf("%s-%s-%d", uniqueQueueName(t), name, round), 3)
+			started := time.Now()
+			ageClaim(t, q, job.ID, age)
+			status := reap(job, visibility)
+			if time.Since(started) < within {
+				if status != want {
+					t.Fatalf("a claim %s old with a %v visibility timeout is %s, want %s", age, visibility, status, want)
+				}
+				return
 			}
-			break
 		}
-		if round == 3 {
-			t.Fatal("no round reaped within the visibility timeout")
-		}
+		t.Fatalf("%s: no round reaped soon enough to tell", name)
 	}
-	job := enqueueAndClaim(t, q, uniqueQueueName(t), 3)
-	ageClaim(t, q, job.ID, "950 milliseconds")
-	if status := reap(job); status != StatusPending {
-		t.Fatalf("a claim 950ms old survived a 900ms visibility timeout: %s", status)
-	}
+
+	conclusive("not truncated", "10 milliseconds", 900*time.Millisecond, 800*time.Millisecond, StatusProcessing)
+	conclusive("not rounded up", "550 milliseconds", 500*time.Millisecond, 400*time.Millisecond, StatusPending)
 }
 
 func ageClaim(t *testing.T, q *Client, id int64, age string) {
