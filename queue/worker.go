@@ -490,21 +490,26 @@ func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
 	case IsNonRetryable(handlerErr):
 		if failErr := w.client.Fail(ctx, job.ID, handlerErr); failErr != nil {
 			w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
-		} else if w.cfg.OnJobFailed != nil {
-			job.Status = StatusFailed
-			job.LastError = sql.NullString{String: handlerErr.Error(), Valid: true}
-			w.cfg.OnJobFailed(ctx, *job)
+		} else {
+			w.notifyJobFailed(ctx, job, handlerErr)
 		}
 	default:
 		delay := w.cfg.RetryDelay(*job, handlerErr)
 		if retryErr := w.client.Retry(ctx, job.ID, delay, handlerErr); retryErr != nil {
 			w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
-		} else if job.Attempts >= job.MaxAttempts && w.cfg.OnJobFailed != nil {
-			job.Status = StatusFailed
-			job.LastError = sql.NullString{String: handlerErr.Error(), Valid: true}
-			w.cfg.OnJobFailed(ctx, *job)
+		} else if job.Attempts >= job.MaxAttempts {
+			w.notifyJobFailed(ctx, job, handlerErr)
 		}
 	}
+}
+
+func (w *Worker) notifyJobFailed(ctx context.Context, job *Job, cause error) {
+	if w.cfg.OnJobFailed == nil {
+		return
+	}
+	job.Status = StatusFailed
+	job.LastError = sql.NullString{String: cause.Error(), Valid: true}
+	w.cfg.OnJobFailed(ctx, *job)
 }
 
 // reap requeues stuck jobs of the worker's own queues only: its visibility timeout

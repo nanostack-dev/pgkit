@@ -116,6 +116,11 @@ its job, and a job claimed as the worker stops is handed back at once.
 
 ### Long-running and parked jobs
 
+`OnJobFailed` runs after a terminal failure or an exhausted retry has been
+persisted successfully. Its job snapshot has `StatusFailed` and the handler
+error in `LastError`; without a callback, settlement leaves that in-memory
+snapshot untouched.
+
 These primitives let a handler keep, park or hand back the job it holds. The
 workflow package is built on them.
 
