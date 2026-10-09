@@ -1,14 +1,31 @@
 {
-  "extends": "./.svelte-kit/tsconfig.json",
   "compilerOptions": {
-    "allowJs": true,
-    "checkJs": false,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
+    "target": "ES2022",
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
     "moduleResolution": "bundler",
-    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "types": [
+      "vite/client"
+    ],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
     "skipLibCheck": true,
-    "sourceMap": true,
-    "strict": true
-  }
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": [
+    "src"
+  ]
 }
