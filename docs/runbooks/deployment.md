@@ -7,6 +7,8 @@ pgkit deploys through versioned Go module dependencies in consuming applications
 3. In each consumer, update to the reviewed immutable version with `go get github.com/nanostack-dev/pgkit@vX.Y.Z`, then `go mod tidy`. Review `go.mod` and `go.sum`.
 4. Run that consumer's affected integration tests and normal release gates. Deploy through its own runbook; verify job processing, scheduling and workflow progress using the consumer's permitted observability.
 
+The queue's `EnsureSchema` migrates `pgqueue_jobs` to schema version 2, adding the `claims` column (a metadata-only `ADD COLUMN ... DEFAULT 0`). Run it before new workers claim jobs, as `fx/queue` does on start; older workers keep working against the new column during a rolling deploy.
+
 Consumers upgrading from the DAG workflow package port their definitions as described in [upgrading from the DAG package](../../workflow/README.md#upgrading-from-the-dag-package). The new runtime creates `pgworkflow_*` tables and never reads the old ones; drain or abandon old runs before dropping them.
 
 Check release provenance with `git rev-parse vX.Y.Z^{commit}` and the associated CI run. A tag existing is insufficient evidence that consumers have upgraded or that their deployments are healthy. Keep existing tags immutable; publish fixes as a new version.
