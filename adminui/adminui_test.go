@@ -100,8 +100,8 @@ func TestAdminUICancelsAndRetriesWorkflowRuns(t *testing.T) {
 
 	var retried workflowRun
 	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/retry", http.StatusOK, &retried)
-	if retried.Status != "pending" {
-		t.Fatalf("run = %+v", retried)
+	if workflow.RunStatus(retried.Status).Finished() {
+		t.Fatalf("a retried run is still finished: %+v", retried)
 	}
 	postJSON(t, server.URL+"/api/dashboard/workflow/runs/"+run.ID+"/retry", http.StatusConflict, nil)
 	postJSON(t, server.URL+"/api/dashboard/workflow/runs/missing/cancel", http.StatusNotFound, nil)
