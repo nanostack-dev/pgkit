@@ -68,6 +68,9 @@ func (c *Client) StartTx[In, Out any](ctx context.Context, tx *sql.Tx, w *Workfl
 		option.applyToStart(&config)
 	}
 	encoded, err := json.Marshal(input)
+	if err == nil {
+		err = checkStorable(encoded)
+	}
 	if err != nil {
 		return Run[Out]{}, fmt.Errorf("workflow: encode %T input: %w", input, err)
 	}
@@ -139,13 +142,14 @@ func (c *Client) enqueueRunJobTx(ctx context.Context, tx *sql.Tx, runID, queueNa
 	return nil
 }
 
-// Run is a typed handle on the run of w with this ID. It does not check that the
-// run exists.
+// Run is a typed handle on the run with this ID, decoding its output as w's. It
+// neither checks that the run exists nor that it is a run of w.
 func (c *Client) Run[In, Out any](w *Workflow[In, Out], runID string) Run[Out] {
 	return Run[Out]{ID: runID, client: c}
 }
 
-// RunByKey returns the run of w started with this Key, or ErrRunNotFound.
+// RunByKey returns the run of w's name started with this Key, whatever its
+// version (keys are unique per workflow name), or ErrRunNotFound.
 func (c *Client) RunByKey[In, Out any](ctx context.Context, w *Workflow[In, Out], key string) (Run[Out], error) {
 	var runID string
 	err := c.db.QueryRowContext(ctx,
@@ -183,6 +187,9 @@ func (c *Client) SignalTx[T any](ctx context.Context, tx *sql.Tx, runID string, 
 		return fmt.Errorf("%w: signal %q", ErrInvalidName, signal.name)
 	}
 	payload, err := json.Marshal(value)
+	if err == nil {
+		err = checkStorable(payload)
+	}
 	if err != nil {
 		return fmt.Errorf("workflow: encode %T signal: %w", value, err)
 	}

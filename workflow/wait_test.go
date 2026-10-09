@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -340,16 +341,28 @@ func TestASignalOfAnotherNameDoesNotWakeTheRun(t *testing.T) {
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
 	h.waitForStatus(run.ID, RunWaiting)
-	lease := h.lease(run.ID)
+	availableBefore := h.jobAvailableAt(run.ID)
+	leaseBefore := h.lease(run.ID)
 
 	if err := h.client.Signal(h.ctx, run.ID, NewSignal[string]("unrelated"), "hello"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond)
 
-	if h.lease(run.ID) != lease || h.run(run.ID).Status != RunWaiting {
+	if after := h.jobAvailableAt(run.ID); !after.Equal(availableBefore) {
+		t.Fatalf("an unrelated signal made the parked job due: %v -> %v", availableBefore, after)
+	}
+	if h.run(run.ID).Status != RunWaiting || h.lease(run.ID) != leaseBefore {
 		t.Fatal("an unrelated signal woke the run")
 	}
+}
+
+func (h *harness) jobAvailableAt(runID string) time.Time {
+	h.t.Helper()
+	var at time.Time
+	if err := h.db.QueryRowContext(h.ctx, `SELECT j.available_at FROM pgqueue_jobs j JOIN pgworkflow_runs r ON r.job_id = j.id WHERE r.id = $1`, runID).Scan(&at); err != nil {
+		h.t.Fatalf("job availability: %v", err)
+	}
+	return at
 }
 
 func TestSignalingAFinishedRunFails(t *testing.T) {
@@ -409,43 +422,53 @@ func TestSignalingWithAnInvalidSignalFails(t *testing.T) {
 
 func TestNoSignalIsLostWhileTheRunParksAndWakes(t *testing.T) {
 	h := newHarness(t)
-	const total = 40
+	const senders, perSender = 4, 10
 	increments := NewSignal[int]("increment")
-	flow := Define("accumulator", func(wf *Context, _ struct{}) (int, error) {
-		sum := 0
-		for range total {
+	flow := Define("accumulator", func(wf *Context, _ struct{}) ([]int, error) {
+		var received []int
+		for range senders * perSender {
 			value, err := wf.Receive(increments, Forever)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
-			sum += value
+			received = append(received, value)
 		}
-		return sum, nil
+		return received, nil
 	})
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
+	h.waitForStatus(run.ID, RunWaiting)
 
-	var senders sync.WaitGroup
-	for sender := range 4 {
-		senders.Go(func() {
-			for i := range total / 4 {
+	var group sync.WaitGroup
+	var want []int
+	for sender := range senders {
+		for i := range perSender {
+			want = append(want, sender*100+i)
+		}
+		group.Go(func() {
+			for i := range perSender {
+				if i%3 == 0 {
+					h.waitForStatus(run.ID, RunWaiting)
+				}
 				if err := h.client.Signal(h.ctx, run.ID, increments, sender*100+i); err != nil {
 					t.Errorf("signal: %v", err)
 				}
-				time.Sleep(time.Duration(i%3) * 5 * time.Millisecond)
 			}
 		})
 	}
-	senders.Wait()
+	group.Wait()
 
-	want := 0
-	for sender := range 4 {
-		for i := range total / 4 {
-			want += sender*100 + i
-		}
+	got := mustResult(h, run)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("received %v, want each of %v once", got, want)
 	}
-	if got := mustResult(h, run); got != want {
-		t.Fatalf("sum = %d, want %d", got, want)
+	if h.queryInt(`SELECT count(*) FROM pgworkflow_signals WHERE received_by IS NULL`) != 0 {
+		t.Fatal("a signal was left unreceived")
+	}
+	if h.lease(run.ID) < 2 {
+		t.Fatal("the run never parked between signals, so the park boundary was not exercised")
 	}
 }
 
@@ -470,3 +493,30 @@ func TestASignalPayloadThatNoLongerDecodesFailsTheRun(t *testing.T) {
 }
 
 var _ = sql.ErrNoRows
+
+func TestASignalSentAfterTheReceiveTimedOutIsNotReceived(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("late-signal", func(wf *Context, _ struct{}) (string, error) {
+		decision, err := wf.Receive(approved, time.Hour)
+		if errors.Is(err, ErrTimeout) {
+			return "timed out", nil
+		}
+		return "approved by " + decision.By, err
+	})
+	run := mustStart(h, flow, struct{}{})
+	h.startWorker(flow)
+	h.waitForStatus(run.ID, RunWaiting)
+	h.exec(`UPDATE pgworkflow_steps SET wake_at = NOW() - interval '1 minute' WHERE run_id = $1`, run.ID)
+
+	if err := h.client.Signal(h.ctx, run.ID, approved, approval{By: "too late"}); err != nil {
+		t.Fatal(err)
+	}
+	h.wakeJob(run.ID)
+
+	if got := mustResult(h, run); got != "timed out" {
+		t.Fatalf("result = %q", got)
+	}
+	if h.queryInt(`SELECT count(*) FROM pgworkflow_signals WHERE received_by IS NULL`) != 1 {
+		t.Fatal("the late signal was consumed")
+	}
+}

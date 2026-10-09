@@ -130,27 +130,37 @@ func (c *Client) CountRuns(ctx context.Context, params ListRunsParams) (int64, e
 	return count, nil
 }
 
-// Purge deletes finished runs completed more than params.OlderThan ago, with their
-// checkpoints and signals, and returns how many runs it deleted. A child whose
-// parent is still unfinished is kept, as the parent may still read its result. Run
-// Purge periodically to bound the tables; the queue's own Purge removes finished
-// jobs.
+// Purge deletes whole run trees, a top-level run with all its children, once the
+// top-level run finished more than params.OlderThan ago and every run of the tree is
+// finished. Their checkpoints and signals go with them. Limit, when positive,
+// bounds the number of trees. Children are never purged apart from their parent, so
+// retrying a retained parent finds them. Run Purge periodically to bound the
+// tables; the queue's own Purge removes finished jobs.
 func (c *Client) Purge(ctx context.Context, params PurgeParams) (int64, error) {
 	var limit any
 	if params.Limit > 0 {
 		limit = params.Limit
 	}
 	res, err := c.db.ExecContext(ctx, `
+WITH RECURSIVE roots AS (
+    SELECT root.id FROM pgworkflow_runs root
+    WHERE root.status IN ('succeeded', 'failed', 'cancelled')
+      AND root.completed_at < NOW() - make_interval(secs => $1)
+      AND NOT EXISTS (SELECT 1 FROM pgworkflow_runs parent WHERE parent.id = root.parent_run_id)
+    ORDER BY root.completed_at
+), tree AS (
+    SELECT id AS root_id, id FROM roots
+    UNION ALL
+    SELECT tree.root_id, child.id FROM pgworkflow_runs child JOIN tree ON child.parent_run_id = tree.id
+), purgeable AS (
+    SELECT root_id FROM tree JOIN pgworkflow_runs run ON run.id = tree.id
+    GROUP BY root_id
+    HAVING bool_and(run.status IN ('succeeded', 'failed', 'cancelled'))
+    LIMIT $2
+)
 DELETE FROM pgworkflow_runs
-WHERE id IN (
-    SELECT run.id FROM pgworkflow_runs run
-    WHERE run.status IN ('succeeded', 'failed', 'cancelled')
-      AND run.completed_at < NOW() - make_interval(secs => $1)
-      AND NOT EXISTS (
-          SELECT 1 FROM pgworkflow_runs parent
-          WHERE parent.id = run.parent_run_id AND parent.status IN ('pending', 'running', 'waiting'))
-    ORDER BY run.completed_at
-    LIMIT $2)`, max(params.OlderThan, 0).Seconds(), limit)
+WHERE id IN (SELECT tree.id FROM tree JOIN purgeable ON purgeable.root_id = tree.root_id)`,
+		max(params.OlderThan, 0).Seconds(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("workflow: purge runs: %w", err)
 	}
@@ -158,7 +168,8 @@ WHERE id IN (
 }
 
 // Run is a typed handle on a run, returned by Client.Start, Client.Run and
-// Client.RunByKey.
+// Client.RunByKey. Its output decodes into Out; the handle does not check that the
+// run belongs to the workflow it was obtained with.
 type Run[Out any] struct {
 	ID     string
 	client *Client

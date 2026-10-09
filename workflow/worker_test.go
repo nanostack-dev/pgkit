@@ -180,28 +180,40 @@ func TestEveryStepRunsExactlyOnceAcrossCompetingWorkers(t *testing.T) {
 
 func TestHeartbeatsKeepALongStepOnItsWorker(t *testing.T) {
 	h := newHarness(t)
+	long := newGate()
 	calls := newCounter()
 	flow := Define("marathon", func(wf *Context, _ struct{}) (string, error) {
 		return wf.Step("long", func(ctx context.Context) (string, error) {
 			calls.add("long")
-			select {
-			case <-time.After(3 * time.Second):
-				return "finished", nil
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
+			return "finished", long.wait(ctx)
 		}, NoRetry)
 	})
-	short := WorkerConfig{VisibilityTimeout: time.Second, ReapInterval: 50 * time.Millisecond}
-	h.startWorkerWith(workerOptions{id: "first", config: short}, flow)
-	h.startWorkerWith(workerOptions{id: "second", config: short}, flow)
+	h.startWorkerWith(workerOptions{config: WorkerConfig{VisibilityTimeout: 600 * time.Millisecond, ReapInterval: time.Hour}}, flow)
+	run := mustStart(h, flow, struct{}{})
+	long.awaitReached(t)
+	claimedAt := h.jobClaimedAt(run.ID)
 
-	if got := mustResult(h, mustStart(h, flow, struct{}{})); got != "finished" {
+	h.eventually("a heartbeat renews the claim", func() bool { return h.jobClaimedAt(run.ID).After(claimedAt) })
+	if _, err := h.queue.Reap(h.ctx, queue.ReapParams{VisibilityTimeout: 600 * time.Millisecond, QueueNames: []string{flow.definition.queueName()}}); err != nil {
+		t.Fatal(err)
+	}
+	long.release()
+
+	if got := mustResult(h, run); got != "finished" {
 		t.Fatalf("result = %q", got)
 	}
 	if calls.get("long") != 1 {
 		t.Fatalf("the long step ran %d times", calls.get("long"))
 	}
+}
+
+func (h *harness) jobClaimedAt(runID string) time.Time {
+	h.t.Helper()
+	var at sql.NullTime
+	if err := h.db.QueryRowContext(h.ctx, `SELECT j.claimed_at FROM pgqueue_jobs j JOIN pgworkflow_runs r ON r.job_id = j.id WHERE r.id = $1`, runID).Scan(&at); err != nil {
+		h.t.Fatalf("claimed at: %v", err)
+	}
+	return at.Time
 }
 
 func TestAnActivationThatLostItsClaimStops(t *testing.T) {
@@ -237,17 +249,82 @@ func TestAStaleActivationCannotWriteCheckpoints(t *testing.T) {
 	flow := Define("fenced", func(wf *Context, _ struct{}) (int, error) { return 1, nil })
 	run := mustStart(h, flow, struct{}{})
 	job := claimRunJob(t, h, flow, run.ID)
+	record := func(act *activation, name string) error {
+		return act.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO pgworkflow_steps (run_id, name, kind, status) VALUES ($1, $2, 'sleep', 'succeeded')`, run.ID, name)
+			return err
+		})
+	}
 
 	stale := beginTestActivation(t, h, flow, job, run.ID)
 	current := beginTestActivation(t, h, flow, job, run.ID)
 
-	err := stale.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error { return nil })
-	requireErrorIs(t, err, ErrSuspended)
+	requireErrorIs(t, record(stale, "from-stale"), ErrSuspended)
 	if reason, _ := stale.stopState(); reason != leaseLost {
 		t.Fatalf("stale activation stopped for reason %d", reason)
 	}
-	if err := current.checkpointWrite(func(ctx context.Context, tx *sql.Tx) error { return nil }); err != nil {
+	if err := record(current, "from-current"); err != nil {
 		t.Fatalf("current activation: %v", err)
+	}
+	if h.queryInt(`SELECT count(*) FROM pgworkflow_steps WHERE run_id = $1 AND name = 'from-stale'`, run.ID) != 0 {
+		t.Fatal("the stale activation wrote a checkpoint")
+	}
+	if h.queryInt(`SELECT count(*) FROM pgworkflow_steps WHERE run_id = $1 AND name = 'from-current'`, run.ID) != 1 {
+		t.Fatal("the current activation's checkpoint is missing")
+	}
+}
+
+func TestAWorkerWhoseClaimWasTakenBackCannotStartTheRun(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("reclaimed", func(wf *Context, _ struct{}) (int, error) { return 1, nil })
+	run := mustStart(h, flow, struct{}{})
+	stale := claimRunJob(t, h, flow, run.ID)
+	h.exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - interval '1 hour' WHERE id = $1`, stale.ID)
+	if _, err := h.queue.Reap(h.ctx, queue.ReapParams{VisibilityTimeout: time.Minute, QueueNames: []string{flow.definition.queueName()}}); err != nil {
+		t.Fatal(err)
+	}
+	current := claimRunJob(t, h, flow, run.ID)
+	holder := beginTestActivation(t, h, flow, current, run.ID)
+	lease := h.lease(run.ID)
+
+	act, err := h.client.beginActivation(h.ctx, flow.definition, WorkerConfig{}.withDefaults(), stale, run.ID)
+
+	if err != nil || act != nil {
+		t.Fatalf("a stale claim began an activation: act=%v err=%v", act, err)
+	}
+	if h.lease(run.ID) != lease {
+		t.Fatal("a stale claim bumped the lease")
+	}
+	if job, _ := h.queue.GetJob(h.ctx, current.ID); job.Status != queue.StatusProcessing {
+		t.Fatalf("a stale claim settled the current claim: %s", job.Status)
+	}
+	if err := holder.checkpointWrite(func(context.Context, *sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("the current holder lost the run: %v", err)
+	}
+}
+
+func TestARunWhoseJobWasDeletedFails(t *testing.T) {
+	h := newHarness(t)
+	flow := approvalFlow("orphan", Forever)
+	failed := make(chan RunInfo, 1)
+	h.startWorkerWith(workerOptions{config: WorkerConfig{ReapInterval: 50 * time.Millisecond, OnRunFailed: func(_ context.Context, run RunInfo) {
+		failed <- run
+	}}}, flow)
+	run := mustStart(h, flow, struct{}{})
+	h.waitForStatus(run.ID, RunWaiting)
+
+	h.exec(`DELETE FROM pgqueue_jobs WHERE id = (SELECT job_id FROM pgworkflow_runs WHERE id = $1)`, run.ID)
+
+	if runErr := mustFail(h, run); runErr.Message != "the run's job was deleted" {
+		t.Fatalf("message = %q", runErr.Message)
+	}
+	select {
+	case info := <-failed:
+		if info.ID != run.ID {
+			t.Fatalf("OnRunFailed got %s", info.ID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnRunFailed was not called for a reconciled run")
 	}
 }
 

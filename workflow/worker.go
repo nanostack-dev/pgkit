@@ -25,7 +25,7 @@ type WorkerConfig struct {
 	// ReapInterval is how often the worker looks for runs whose worker stopped
 	// heartbeating. Default 10s.
 	ReapInterval time.Duration
-	// OnRunFailed is called after a run fails.
+	// OnRunFailed is called after a run this worker executed or reconciled fails.
 	OnRunFailed func(ctx context.Context, run RunInfo)
 }
 
@@ -180,7 +180,7 @@ func (w *Worker) reconcile(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.client.failOrphanedRuns(ctx); err != nil && ctx.Err() == nil {
+			if err := w.client.failOrphanedRuns(ctx, w.config.OnRunFailed); err != nil && ctx.Err() == nil {
 				w.client.log.Warn(ctx, "workflow reconcile failed", map[string]any{"error": err.Error()})
 			}
 		}
@@ -204,9 +204,6 @@ func (w *Worker) handler(def *definition, config WorkerConfig) queue.Handler {
 			return err
 		}
 		if act == nil {
-			if err := w.client.queue.Ack(ctx, job.ID); err != nil && !errors.Is(err, queue.ErrJobNotFound) {
-				return err
-			}
 			return queue.Handled()
 		}
 		return act.execute(ctx)
@@ -214,8 +211,11 @@ func (w *Worker) handler(def *definition, config WorkerConfig) queue.Handler {
 }
 
 // beginActivation takes ownership of the run named by job by bumping its lease,
-// which fences writes from any activation still running elsewhere. It returns nil
-// when the job is stale: the run finished, or a retry gave it a new job.
+// which fences writes from any activation still running elsewhere. It holds the
+// job's claim while doing so, so a worker whose claim the reaper took back cannot
+// displace the worker that holds it now. It returns nil, with nothing left to do,
+// when the claim is gone or the job is stale (the run finished, or a retry gave it a
+// new job); a stale job is acknowledged.
 func (c *Client) beginActivation(workerCtx context.Context, def *definition, config WorkerConfig, job queue.Job, runID string) (*activation, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), bookkeepingTimeout)
 	defer cancel()
@@ -229,12 +229,22 @@ func (c *Client) beginActivation(workerCtx context.Context, def *definition, con
 		occurrences: map[string]int{},
 		runCtx:      workerCtx,
 	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("workflow: begin run %s: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := c.queue.LockClaimTx(ctx, tx, job); errors.Is(err, queue.ErrJobNotFound) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
 	var (
 		input       []byte
 		deadlineAt  sql.NullTime
 		secondsLeft sql.NullFloat64
 	)
-	err := c.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 UPDATE pgworkflow_runs
 SET status = 'running', lease = lease + 1, started_at = COALESCE(started_at, NOW()), wake_at = NULL, updated_at = NOW()
 WHERE id = $1 AND job_id = $2 AND status IN ('pending', 'running', 'waiting')
@@ -242,10 +252,16 @@ RETURNING lease, input, COALESCE(parent_run_id, ''), deadline_at, EXTRACT(EPOCH 
 		runID, job.ID,
 	).Scan(&act.lease, &input, &act.parentRunID, &deadlineAt, &secondsLeft)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		if err := c.queue.AckTx(ctx, tx, job.ID); err != nil {
+			return nil, err
+		}
+		return nil, tx.Commit()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("workflow: begin run %s: %w", runID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("workflow: commit run %s start: %w", runID, err)
 	}
 	act.input = input
 	act.deadline = deadlineFrom(deadlineAt, secondsLeft)
@@ -255,23 +271,27 @@ RETURNING lease, input, COALESCE(parent_run_id, ''), deadline_at, EXTRACT(EPOCH 
 	return act, nil
 }
 
-// failOrphanedRuns fails unfinished runs whose job the queue gave up on, after
-// crashes or reaps used all its attempts: no activation would ever finish them.
-func (c *Client) failOrphanedRuns(ctx context.Context) error {
+const orphanedRunCondition = `run.status IN ('pending', 'running', 'waiting')
+  AND (job.id IS NULL OR job.status IN ('failed', 'done'))`
+
+// failOrphanedRuns fails unfinished runs that no activation will ever finish: their
+// job failed after crashes or reaps used all its attempts, was settled outside the
+// runtime, or was deleted.
+func (c *Client) failOrphanedRuns(ctx context.Context, onRunFailed func(context.Context, RunInfo)) error {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT run.id, COALESCE(job.last_error, '')
+SELECT run.id, COALESCE(job.status, 'deleted'), COALESCE(job.last_error, '')
 FROM pgworkflow_runs run
-JOIN pgqueue_jobs job ON job.id = run.job_id
-WHERE run.status IN ('pending', 'running', 'waiting') AND job.status = 'failed'
+LEFT JOIN pgqueue_jobs job ON job.id = run.job_id
+WHERE `+orphanedRunCondition+`
 LIMIT 100`)
 	if err != nil {
 		return fmt.Errorf("workflow: find orphaned runs: %w", err)
 	}
-	type orphan struct{ runID, lastError string }
+	type orphan struct{ runID, jobStatus, lastError string }
 	var orphans []orphan
 	for rows.Next() {
 		var found orphan
-		if err := rows.Scan(&found.runID, &found.lastError); err != nil {
+		if err := rows.Scan(&found.runID, &found.jobStatus, &found.lastError); err != nil {
 			_ = rows.Close()
 			return err
 		}
@@ -281,54 +301,69 @@ LIMIT 100`)
 		return err
 	}
 	for _, found := range orphans {
-		if err := c.failOrphanedRun(ctx, found.runID, found.lastError); err != nil {
+		failed, err := c.failOrphanedRun(ctx, found.runID, orphanMessage(found.jobStatus, found.lastError))
+		if err != nil {
 			return err
+		}
+		if failed && onRunFailed != nil {
+			if info, err := c.GetRun(ctx, found.runID); err == nil {
+				onRunFailed(ctx, info)
+			}
 		}
 	}
 	return nil
 }
 
-func (c *Client) failOrphanedRun(ctx context.Context, runID, lastError string) error {
+func orphanMessage(jobStatus, lastError string) string {
+	switch jobStatus {
+	case "deleted":
+		return "the run's job was deleted"
+	case "done":
+		return "the run's job was settled while the run was unfinished"
+	}
+	if lastError == "" {
+		return "the queue gave up on the run's job"
+	}
+	return "the queue gave up on the run's job: " + lastError
+}
+
+func (c *Client) failOrphanedRun(ctx context.Context, runID, message string) (bool, error) {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	var parentRunID sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT parent_run_id FROM pgworkflow_runs WHERE id = $1`, runID).Scan(&parentRunID); err != nil {
-		return err
+		return false, err
 	}
 	if parentRunID.Valid {
 		if err := c.wakeParentTx(ctx, tx, parentRunID.String); err != nil {
-			return err
+			return false, err
 		}
 	}
 	var orphaned bool
 	err = tx.QueryRowContext(ctx, `
-SELECT TRUE FROM pgworkflow_runs run JOIN pgqueue_jobs job ON job.id = run.job_id
-WHERE run.id = $1 AND run.status IN ('pending', 'running', 'waiting') AND job.status = 'failed'
+SELECT TRUE FROM pgworkflow_runs run LEFT JOIN pgqueue_jobs job ON job.id = run.job_id
+WHERE run.id = $1 AND `+orphanedRunCondition+`
 FOR UPDATE OF run`, runID).Scan(&orphaned)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
-	}
-	message := "the queue gave up on the run's job"
-	if lastError != "" {
-		message += ": " + lastError
+		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE pgworkflow_runs
 SET status = 'failed', error = $2, completed_at = NOW(), wake_at = NULL, updated_at = NOW()
 WHERE id = $1`, runID, message); err != nil {
-		return err
+		return false, err
 	}
 	if err := c.cancelDescendantsTx(ctx, tx, runID); err != nil {
-		return err
+		return false, err
 	}
 	if err := c.queue.NotifyTx(ctx, tx, runNotifyKey(runID)); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	return true, tx.Commit()
 }

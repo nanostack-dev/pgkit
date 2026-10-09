@@ -96,6 +96,24 @@ CREATE TABLE IF NOT EXISTS pgworkflow_signals (
 CREATE INDEX IF NOT EXISTS pgworkflow_signals_by_run ON pgworkflow_signals (run_id, name, id);
 `
 
+// errUnstorableNUL reports JSON that PostgreSQL's jsonb rejects: a string holding
+// the NUL character, encoded as \u0000.
+var errUnstorableNUL = errors.New("contains a NUL character, which PostgreSQL cannot store in JSONB")
+
+// checkStorable returns errUnstorableNUL for JSON that holds a \u0000 escape.
+func checkStorable(raw []byte) error {
+	for i := 0; i+6 <= len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		if string(raw[i:i+6]) == `\u0000` {
+			return errUnstorableNUL
+		}
+		i++
+	}
+	return nil
+}
+
 func jsonUnmarshal(raw json.RawMessage, target any) error {
 	if len(raw) == 0 {
 		raw = json.RawMessage("null")

@@ -121,14 +121,18 @@ workflow package is built on them.
 
 ```go
 err := client.Heartbeat(ctx, job)                  // extend the claim; ErrJobNotFound once it is lost
-err = client.SnoozeTx(ctx, tx, job, until)         // back to pending at until, attempt refunded
+err = client.LockClaimTx(ctx, tx, job)             // hold the claim (row lock) for the rest of tx
+err = client.SnoozeTx(ctx, tx, job, until)         // back to pending at until, attempt not counted
 err = client.SnoozeTx(ctx, tx, job, time.Time{})   // parked until woken (available at queue.ParkedUntil)
 err = client.WakeTx(ctx, tx, jobID)                // a parked or delayed job becomes due now, workers notified
 ```
 
-`Heartbeat` and `SnoozeTx` act only on the claim described by `job` (its ID and
-attempt number), so a handler whose job was reaped and claimed elsewhere cannot
-touch the new claim. Durations and timeouts keep sub-second precision.
+`Heartbeat`, `LockClaimTx` and `SnoozeTx` act only on the claim described by
+`job`, its ID and attempt number, so a handler whose job was reaped and claimed
+elsewhere cannot touch the new claim. Attempt numbers only grow: instead of
+refunding the attempt, `SnoozeTx` raises the job's `MaxAttempts` by one. Durations
+and timeouts keep sub-second precision; `Reap` refuses a non-positive visibility
+timeout.
 
 `client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
 `LISTEN` connection for other keys: a subscription wakes when a notification for

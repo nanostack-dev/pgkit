@@ -118,12 +118,14 @@ func TestNoRetryAttemptsAStepOnce(t *testing.T) {
 		}, NoRetry)
 	})
 	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
 
-	_, _ = result(h, mustStart(h, flow, struct{}{}))
+	awaitFailure(h, run)
 
 	if calls.get("once") != 1 {
 		t.Fatalf("calls = %d", calls.get("once"))
 	}
+	h.requireStep(run.ID, "once", StepFailed, 1)
 }
 
 func TestStepsAreAttemptedThreeTimesByDefault(t *testing.T) {
@@ -136,12 +138,14 @@ func TestStepsAreAttemptedThreeTimesByDefault(t *testing.T) {
 		})
 	}, Retry{Backoff: time.Millisecond})
 	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
 
-	_, _ = result(h, mustStart(h, flow, struct{}{}))
+	awaitFailure(h, run)
 
 	if calls.get("default") != defaultMaxAttempts {
 		t.Fatalf("calls = %d, want %d", calls.get("default"), defaultMaxAttempts)
 	}
+	h.requireStep(run.ID, "default", StepFailed, defaultMaxAttempts)
 }
 
 func TestAWorkflowRetryAppliesToItsStepsUnlessAStepOverridesIt(t *testing.T) {
@@ -217,8 +221,13 @@ func TestAShortBackoffRetriesWithoutSuspendingTheRun(t *testing.T) {
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
 
-	mustResult(h, run)
-
+	if got := mustResult(h, run); got != "ok" {
+		t.Fatalf("result = %q", got)
+	}
+	if calls.get("call-api") != 3 {
+		t.Fatalf("calls = %d", calls.get("call-api"))
+	}
+	h.requireStep(run.ID, "call-api", StepSucceeded, 3)
 	if lease := h.lease(run.ID); lease != 1 {
 		t.Fatalf("the run was activated %d times, want once", lease)
 	}
@@ -227,14 +236,17 @@ func TestAShortBackoffRetriesWithoutSuspendingTheRun(t *testing.T) {
 func TestATimeoutBoundsEachAttempt(t *testing.T) {
 	h := newHarness(t)
 	calls := newCounter()
+	secondAttempt := make(chan string, 1)
 	flow := Define("slow", func(wf *Context, _ struct{}) (string, error) {
 		return wf.Step("call-api", func(ctx context.Context) (string, error) {
 			if calls.add("call-api") == 1 {
 				<-ctx.Done()
 				return "", ctx.Err()
 			}
+			deadline, hasDeadline := ctx.Deadline()
+			secondAttempt <- fmt.Sprintf("err=%v deadline=%v remaining>40ms=%v", ctx.Err(), hasDeadline, time.Until(deadline) > 40*time.Millisecond)
 			return "fast enough", nil
-		}, Timeout(50*time.Millisecond), fastRetry)
+		}, Timeout(100*time.Millisecond), fastRetry)
 	})
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
@@ -242,9 +254,10 @@ func TestATimeoutBoundsEachAttempt(t *testing.T) {
 	if got := mustResult(h, run); got != "fast enough" {
 		t.Fatalf("result = %q", got)
 	}
-	if calls.get("call-api") != 2 {
-		t.Fatalf("calls = %d", calls.get("call-api"))
+	if got := <-secondAttempt; got != "err=<nil> deadline=true remaining>40ms=true" {
+		t.Fatalf("the second attempt did not get a fresh bounded context: %s", got)
 	}
+	h.requireStep(run.ID, "call-api", StepSucceeded, 2)
 }
 
 func TestAPanickingAttemptIsAFailedAttempt(t *testing.T) {
@@ -722,21 +735,25 @@ func TestAsyncResultsAreReplayed(t *testing.T) {
 
 func TestARunWaitsForAsyncStepsItDidNotWaitFor(t *testing.T) {
 	h := newHarness(t)
+	audit := newGate()
 	flow := Define("fire-and-forget", func(wf *Context, _ struct{}) (string, error) {
-		wf.Async("audit", func(context.Context) (string, error) {
-			time.Sleep(100 * time.Millisecond)
-			return "audited", nil
+		wf.Async("audit", func(ctx context.Context) (string, error) {
+			return "audited", audit.wait(ctx)
 		})
 		return "returned early", nil
 	})
 	h.startWorker(flow)
 	run := mustStart(h, flow, struct{}{})
+	audit.awaitReached(t)
+
+	time.Sleep(200 * time.Millisecond)
+	if status := h.run(run.ID).Status; status.Finished() {
+		t.Fatalf("the run finished before its async step: %s", status)
+	}
+	audit.release()
 
 	mustResult(h, run)
-
-	if step := h.step(run.ID, "audit"); step.Status != StepSucceeded {
-		t.Fatalf("the run finished before its async step: %+v", step)
-	}
+	h.requireStep(run.ID, "audit", StepSucceeded, 1)
 }
 
 func TestAsyncStepFailuresSurfaceThroughWait(t *testing.T) {

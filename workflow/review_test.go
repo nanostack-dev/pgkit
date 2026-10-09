@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -46,7 +47,7 @@ func TestCancelReachesAGrandchildStartedDuringTheCancel(t *testing.T) {
 
 	cancelled := make(chan error, 1)
 	go func() { cancelled <- h.client.Cancel(h.ctx, root.ID) }()
-	time.Sleep(300 * time.Millisecond)
+	h.waitForLockWaiters(1)
 	if err := startingGrandchild.Commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -148,12 +149,14 @@ func TestAStepRetryKeepsTheWorkflowValuesItLeavesZero(t *testing.T) {
 		}, Retry{Backoff: time.Millisecond})
 	}, Retry{MaxAttempts: 5})
 	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
 
-	_, _ = result(h, mustStart(h, flow, struct{}{}))
+	awaitFailure(h, run)
 
 	if calls.get("flaky") != 5 {
 		t.Fatalf("attempts = %d, want the workflow's 5", calls.get("flaky"))
 	}
+	h.requireStep(run.ID, "flaky", StepFailed, 5)
 }
 
 func TestTheFirstExecutionSeesWhatReplaysSee(t *testing.T) {
@@ -162,19 +165,148 @@ func TestTheFirstExecutionSeesWhatReplaysSee(t *testing.T) {
 		Shown  string `json:"shown"`
 		Hidden string `json:"-"`
 	}
+	observed := make(chan string, 4)
 	flow := Define("json-shaped", func(wf *Context, _ struct{}) (string, error) {
-		value, err := wf.Step("shape", func(context.Context) (withHidden, error) {
+		plain, err := wf.Step("plain", func(context.Context) (withHidden, error) {
 			return withHidden{Shown: "kept", Hidden: "dropped"}, nil
 		})
-		return value.Shown + "/" + value.Hidden, err
+		if err != nil {
+			return "", err
+		}
+		transactional, err := wf.TxStep("transactional", func(context.Context, *sql.Tx) (withHidden, error) {
+			return withHidden{Shown: "kept", Hidden: "dropped"}, nil
+		})
+		if err != nil {
+			return "", err
+		}
+		observed <- plain.Shown + "/" + plain.Hidden + " " + transactional.Shown + "/" + transactional.Hidden
+		return "", wf.Sleep("replay", time.Hour)
 	})
 	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+	h.waitForStatus(run.ID, RunWaiting)
+	h.fastForward(run.ID)
+	mustResult(h, run)
+	close(observed)
 
-	if got := mustResult(h, mustStart(h, flow, struct{}{})); got != "kept/" {
-		t.Fatalf("first execution saw %q", got)
+	var seen []string
+	for observation := range observed {
+		seen = append(seen, observation)
+	}
+	if len(seen) != 2 || seen[0] != "kept/ kept/" || seen[1] != seen[0] {
+		t.Fatalf("first execution and replay saw %q", seen)
 	}
 }
 
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// waitForLockWaiters waits until n sessions of the test database wait for a lock,
+// proving a concurrent transaction is blocked where the test expects it.
+func (h *harness) waitForLockWaiters(n int) {
+	h.t.Helper()
+	h.eventually(fmt.Sprintf("%d session(s) wait for a lock", n), func() bool {
+		return h.queryInt(`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`) >= n
+	})
+}
+
+func TestAStepResultHoldingANULCharacterFailsWithoutRetry(t *testing.T) {
+	h := newHarness(t)
+	calls := newCounter()
+	flow := Define("nul-result", func(wf *Context, _ struct{}) (string, error) {
+		return wf.Step("binary", func(context.Context) (string, error) {
+			calls.add("binary")
+			return "a\x00b", nil
+		})
+	})
+	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+
+	runErr := mustFail(h, run)
+
+	if calls.get("binary") != 1 || !strings.Contains(runErr.Message, "NUL character") {
+		t.Fatalf("calls = %d, message = %q", calls.get("binary"), runErr.Message)
+	}
+	h.requireStep(run.ID, "binary", StepFailed, 1)
+}
+
+func TestStartRefusesAnInputHoldingANULCharacter(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("nul-input", func(wf *Context, in string) (string, error) { return in, nil })
+	_, err := h.client.Start(h.ctx, flow, "a\x00b")
+	requireErrorIs(t, err, errUnstorableNUL)
+	if checkStorable([]byte(`"a\\u0000"`)) != nil {
+		t.Fatal("an escaped backslash before u0000 was taken for a NUL")
+	}
+}
+
+func TestATxStepWhoseCheckpointFailsKeepsNoWrites(t *testing.T) {
+	h := newHarness(t)
+	createLedger(h)
+	h.exec(`CREATE FUNCTION refuse_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'checkpoint refused'; END $$`)
+	h.exec(`CREATE TRIGGER refuse_checkpoint BEFORE UPDATE ON pgworkflow_steps FOR EACH ROW
+		WHEN (NEW.name = 'record' AND NEW.status = 'succeeded') EXECUTE FUNCTION refuse_checkpoint()`)
+	calls := newCounter()
+	flow := Define("ledger-checkpoint", func(wf *Context, _ struct{}) (int, error) {
+		return wf.TxStep("record", func(ctx context.Context, tx *sql.Tx) (int, error) {
+			_, err := tx.ExecContext(ctx, `INSERT INTO ledger (entry) VALUES ('once')`)
+			return calls.add("record"), err
+		})
+	})
+	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+	h.eventually("the step was attempted", func() bool { return calls.get("record") >= 1 })
+
+	if h.queryInt(`SELECT count(*) FROM ledger`) != 0 {
+		t.Fatal("the write committed without its checkpoint")
+	}
+	h.exec(`DROP TRIGGER refuse_checkpoint ON pgworkflow_steps`)
+	h.wakeJob(run.ID)
+
+	mustResult(h, run)
+	if h.queryInt(`SELECT count(*) FROM ledger`) != 1 {
+		t.Fatalf("ledger entries = %d, want exactly one", h.queryInt(`SELECT count(*) FROM ledger`))
+	}
+}
+
+func TestCancelWaitsForATransactionalStepInProgress(t *testing.T) {
+	h := newHarness(t)
+	createLedger(h)
+	reached := newGate()
+	flow := Define("cancel-during-tx", func(wf *Context, _ struct{}) (string, error) {
+		if _, err := wf.TxStep("record", func(ctx context.Context, tx *sql.Tx) (bool, error) {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO ledger (entry) VALUES ('committed')`); err != nil {
+				return false, err
+			}
+			return true, reached.wait(ctx)
+		}); err != nil {
+			return "", err
+		}
+		return "", wf.Sleep("after", time.Hour)
+	})
+	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{})
+	reached.awaitReached(t)
+
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- h.client.Cancel(h.ctx, run.ID) }()
+	h.waitForLockWaiters(1)
+	select {
+	case err := <-cancelled:
+		t.Fatalf("Cancel returned before the transactional step ended: %v", err)
+	default:
+	}
+	reached.release()
+
+	if err := <-cancelled; err != nil {
+		t.Fatal(err)
+	}
+	_, err := result(h, run)
+	requireErrorIs(t, err, ErrCancelled)
+	if h.queryInt(`SELECT count(*) FROM ledger`) != 1 {
+		t.Fatal("the transactional step's effect was lost or repeated")
+	}
+	h.requireStep(run.ID, "record", StepSucceeded, 1)
+}

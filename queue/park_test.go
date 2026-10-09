@@ -84,7 +84,7 @@ func subscribeReady(t *testing.T, q *Client, keys ...string) *Subscription {
 	return sub
 }
 
-func TestSnoozeTxDelaysTheJobWithoutSpendingItsAttempt(t *testing.T) {
+func TestSnoozeTxDelaysTheJobWithoutCountingItsAttempt(t *testing.T) {
 	q := sharedQueue(t)
 	queueName := uniqueQueueName(t)
 	job := enqueueAndClaim(t, q, queueName, 1)
@@ -98,8 +98,8 @@ func TestSnoozeTxDelaysTheJobWithoutSpendingItsAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	if snoozed.Status != StatusPending || snoozed.Attempts != 0 || snoozed.ClaimedBy.Valid {
-		t.Fatalf("snoozed job = %+v", snoozed)
+	if snoozed.Status != StatusPending || snoozed.Attempts != 1 || snoozed.MaxAttempts != 2 || snoozed.ClaimedBy.Valid {
+		t.Fatalf("snoozed job = %+v, want attempt 1 of 2", snoozed)
 	}
 	if !snoozed.AvailableAt.Equal(until) {
 		t.Fatalf("available at %v, want %v", snoozed.AvailableAt, until)
@@ -128,7 +128,7 @@ func TestSnoozeTxWithAZeroTimeParksTheJobUntilWakeTx(t *testing.T) {
 		t.Fatalf("wake: %v", err)
 	}
 	woken := requireClaimable(t, q, queueName, true)
-	if woken.ID != job.ID || woken.Attempts != 1 {
+	if woken.ID != job.ID || woken.Attempts != 2 || woken.MaxAttempts != 2 {
 		t.Fatalf("woken job = %+v", woken)
 	}
 }
@@ -363,76 +363,206 @@ func TestSubscribeRefusesDriversWithoutNotifications(t *testing.T) {
 	}
 }
 
-func TestReapStuckJobsHonorsASubSecondVisibilityTimeout(t *testing.T) {
+func TestReapHonorsASubSecondVisibilityTimeout(t *testing.T) {
 	q := sharedQueue(t)
-	job := enqueueAndClaim(t, q, uniqueQueueName(t), 3)
+	queueName := uniqueQueueName(t)
+	job := enqueueAndClaim(t, q, queueName, 3)
+	reap := func() Job {
+		t.Helper()
+		if _, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: 500 * time.Millisecond, QueueNames: []string{queueName}}); err != nil {
+			t.Fatalf("reap: %v", err)
+		}
+		reaped, err := q.GetJob(context.Background(), job.ID)
+		if err != nil {
+			t.Fatalf("get job: %v", err)
+		}
+		return *reaped
+	}
 
-	if _, err := q.ReapStuckJobs(context.Background(), 500*time.Millisecond); err != nil {
-		t.Fatalf("reap: %v", err)
+	ageClaim(t, q, job.ID, "200 milliseconds")
+	if got := reap(); got.Status != StatusProcessing {
+		t.Fatalf("a claim 200ms old was reaped with a 500ms visibility timeout: %s", got.Status)
 	}
-	if fresh, err := q.GetJob(context.Background(), job.ID); err != nil || fresh.Status != StatusProcessing {
-		t.Fatalf("a job claimed just now was reaped with a 500ms visibility timeout: %+v %v", fresh, err)
+	ageClaim(t, q, job.ID, "800 milliseconds")
+	if got := reap(); got.Status != StatusPending {
+		t.Fatalf("a claim 800ms old survived a 500ms visibility timeout: %s", got.Status)
 	}
-	time.Sleep(600 * time.Millisecond)
-	if _, err := q.ReapStuckJobs(context.Background(), 500*time.Millisecond); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
-	reaped, err := q.GetJob(context.Background(), job.ID)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
-	}
-	if reaped.Status != StatusPending {
-		t.Fatalf("status = %s, want pending after the timeout", reaped.Status)
+}
+
+func ageClaim(t *testing.T, q *Client, id int64, age string) {
+	t.Helper()
+	if _, err := q.DB().Exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - $2::interval WHERE id = $1`, id, age); err != nil {
+		t.Fatalf("age claim: %v", err)
 	}
 }
 
 func TestRetryHonorsASubSecondDelay(t *testing.T) {
 	q := sharedQueue(t)
-	queueName := uniqueQueueName(t)
-	job := enqueueAndClaim(t, q, queueName, 3)
+	job := enqueueAndClaim(t, q, uniqueQueueName(t), 3)
 
-	if err := q.Retry(context.Background(), job.ID, 400*time.Millisecond, errors.New("blip")); err != nil {
+	tx, err := q.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := q.RetryTx(context.Background(), tx, job.ID, 400*time.Millisecond, errors.New("blip")); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	requireClaimable(t, q, queueName, false)
-	time.Sleep(500 * time.Millisecond)
-	requireClaimable(t, q, queueName, true)
+	var delay time.Duration
+	var micros int64
+	if err := tx.QueryRow(`SELECT (EXTRACT(EPOCH FROM available_at - NOW()) * 1000000)::bigint FROM pgqueue_jobs WHERE id = $1`, job.ID).Scan(&micros); err != nil {
+		t.Fatalf("read delay: %v", err)
+	}
+	delay = time.Duration(micros) * time.Microsecond
+	if delay != 400*time.Millisecond {
+		t.Fatalf("delay = %v, want 400ms", delay)
+	}
 }
 
-func TestAHandlerFinishingDuringShutdownStillSettlesItsJob(t *testing.T) {
+func TestReapRefusesANonPositiveVisibilityTimeout(t *testing.T) {
 	q := sharedQueue(t)
-	queueName := uniqueQueueName(t)
-	reached := make(chan struct{})
-	release := make(chan struct{})
-	worker, err := q.Worker("stopping").Pickup(PollEvery(10*time.Millisecond)).HandleRaw(queueName, func(context.Context, Job) error {
-		close(reached)
-		<-release
-		return nil
-	}).Build()
-	if err != nil {
-		t.Fatalf("build: %v", err)
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		if _, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: timeout}); !errors.Is(err, ErrInvalidVisibilityTimeout) {
+			t.Fatalf("timeout %v: expected ErrInvalidVisibilityTimeout, got %v", timeout, err)
+		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.Run(ctx) }()
-	id, err := q.Enqueue(context.Background(), EnqueueParams{QueueName: queueName, Payload: []byte(`{}`)})
-	if err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	<-reached
+}
 
-	cancel()
-	close(release)
-	if err := <-done; err != nil {
+func TestAWorkerWithoutHandlersReapsNothing(t *testing.T) {
+	q := sharedQueue(t)
+	other := enqueueAndClaim(t, q, uniqueQueueName(t), 3)
+	ageClaim(t, q, other.ID, "1 hour")
+	worker, err := NewWorker(q, NewHandlerRegistry(), WorkerConfig{PollInterval: time.Hour, ReapInterval: 10 * time.Millisecond, VisibilityTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := worker.Run(ctx); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
-	job, err := q.GetJob(context.Background(), id)
-	if err != nil {
-		t.Fatalf("get job: %v", err)
+	if job, _ := q.GetJob(context.Background(), other.ID); job.Status != StatusProcessing {
+		t.Fatalf("a worker without handlers reaped another queue's job: %s", job.Status)
 	}
-	if job.Status != StatusDone {
-		t.Fatalf("status = %s, want done", job.Status)
+}
+
+func TestSnoozedAttemptsKeepIdentifyingClaims(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	first := enqueueAndClaim(t, q, queueName, 3)
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *first, time.Unix(0, 0)) }); err != nil {
+		t.Fatalf("snooze: %v", err)
+	}
+	second := requireClaimable(t, q, queueName, true)
+
+	if err := q.Heartbeat(context.Background(), *first); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("the snoozed claim still extends the new one: %v", err)
+	}
+	err := inTx(t, q, func(tx *sql.Tx) error { return q.SnoozeTx(context.Background(), tx, *first, time.Time{}) })
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("the snoozed claim parked the new one: %v", err)
+	}
+	if err := q.Heartbeat(context.Background(), *second); err != nil {
+		t.Fatalf("current claim: %v", err)
+	}
+}
+
+func TestLockClaimTxHoldsOnlyACurrentClaim(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	stale := enqueueAndClaim(t, q, queueName, 3)
+	ageClaim(t, q, stale.ID, "1 hour")
+	if _, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: time.Minute, QueueNames: []string{queueName}}); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	current := requireClaimable(t, q, queueName, true)
+
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.LockClaimTx(context.Background(), tx, *stale) }); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("stale claim: expected ErrJobNotFound, got %v", err)
+	}
+	if err := inTx(t, q, func(tx *sql.Tx) error { return q.LockClaimTx(context.Background(), tx, *current) }); err != nil {
+		t.Fatalf("current claim: %v", err)
+	}
+}
+
+func TestWakeTxRolledBackChangesNothing(t *testing.T) {
+	q := sharedQueue(t)
+	queueName := uniqueQueueName(t)
+	sub := subscribeReady(t, q, queueName)
+	later := databaseNow(t, q).Add(time.Hour)
+	id, err := q.Enqueue(context.Background(), EnqueueParams{QueueName: queueName, Payload: []byte(`{}`), AvailableAt: &later})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	requireWake(t, sub, 5*time.Second)
+
+	rollback := errors.New("rollback")
+	err = inTx(t, q, func(tx *sql.Tx) error {
+		if err := q.WakeTx(context.Background(), tx, id); err != nil {
+			return err
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("expected rollback, got %v", err)
+	}
+
+	requireNoWake(t, sub, 300*time.Millisecond)
+	job, err := q.GetJob(context.Background(), id)
+	if err != nil || !job.AvailableAt.Equal(later) {
+		t.Fatalf("job = %+v, err = %v", job, err)
+	}
+}
+
+func TestAHandlerFinishingDuringShutdownStillSettlesItsJob(t *testing.T) {
+	cases := []struct {
+		name       string
+		outcome    error
+		wantStatus JobStatus
+		wantError  string
+	}{
+		{"success", nil, StatusDone, ""},
+		{"retryable failure", errors.New("try later"), StatusPending, "try later"},
+		{"final failure", NonRetryable(errors.New("give up")), StatusFailed, "give up"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := sharedQueue(t)
+			queueName := uniqueQueueName(t)
+			reached := make(chan struct{})
+			release := make(chan struct{})
+			worker, err := q.Worker("stopping").Pickup(PollEvery(10*time.Millisecond)).HandleRaw(queueName, func(context.Context, Job) error {
+				close(reached)
+				<-release
+				return tc.outcome
+			}).Build()
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- worker.Run(ctx) }()
+			id, err := q.Enqueue(context.Background(), EnqueueParams{QueueName: queueName, Payload: []byte(`{}`)})
+			if err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			<-reached
+
+			cancel()
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatalf("run: %v", err)
+			}
+
+			job, err := q.GetJob(context.Background(), id)
+			if err != nil {
+				t.Fatalf("get job: %v", err)
+			}
+			if job.Status != tc.wantStatus || job.LastError.String != tc.wantError {
+				t.Fatalf("job = %s %q, want %s %q", job.Status, job.LastError.String, tc.wantStatus, tc.wantError)
+			}
+		})
 	}
 }
 
@@ -461,10 +591,12 @@ func TestSnoozeTxRefusesAClaimTheReaperTookBack(t *testing.T) {
 func TestReapOnlyTouchesTheChosenQueues(t *testing.T) {
 	q := sharedQueue(t)
 	mine, other := uniqueQueueName(t), uniqueQueueName(t)+"-other"
-	mineJob := enqueueAndClaim(t, q, mine, 3)
-	otherJob := enqueueAndClaim(t, q, other, 3)
-	if _, err := q.DB().Exec(`UPDATE pgqueue_jobs SET claimed_at = NOW() - interval '1 hour' WHERE id IN ($1, $2)`, mineJob.ID, otherJob.ID); err != nil {
-		t.Fatalf("age claims: %v", err)
+	mineRetryable := enqueueAndClaim(t, q, mine, 3)
+	mineExhausted := enqueueAndClaim(t, q, mine, 1)
+	otherRetryable := enqueueAndClaim(t, q, other, 3)
+	otherExhausted := enqueueAndClaim(t, q, other, 1)
+	for _, job := range []*Job{mineRetryable, mineExhausted, otherRetryable, otherExhausted} {
+		ageClaim(t, q, job.ID, "1 hour")
 	}
 
 	result, err := q.Reap(context.Background(), ReapParams{VisibilityTimeout: time.Minute, QueueNames: []string{mine}})
@@ -472,10 +604,16 @@ func TestReapOnlyTouchesTheChosenQueues(t *testing.T) {
 		t.Fatalf("reap: %v", err)
 	}
 
-	if result.Requeued != 1 {
-		t.Fatalf("requeued %d jobs, want 1", result.Requeued)
+	if result != (ReapResult{Requeued: 1, Failed: 1}) {
+		t.Fatalf("result = %+v, want one requeued and one failed", result)
 	}
-	if job, _ := q.GetJob(context.Background(), otherJob.ID); job.Status != StatusProcessing {
-		t.Fatalf("another queue's job was reaped: %s", job.Status)
+	want := map[int64]JobStatus{
+		mineRetryable.ID: StatusPending, mineExhausted.ID: StatusFailed,
+		otherRetryable.ID: StatusProcessing, otherExhausted.ID: StatusProcessing,
+	}
+	for id, status := range want {
+		if job, _ := q.GetJob(context.Background(), id); job.Status != status {
+			t.Fatalf("job %d = %s, want %s", id, job.Status, status)
+		}
 	}
 }

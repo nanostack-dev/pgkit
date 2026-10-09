@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -12,10 +13,12 @@ import (
 var ParkedUntil = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
 
 // SnoozeTx returns the job a handler holds to pending, claimable again at until,
-// without spending the attempt its claim used. A zero until parks the job until
-// WakeTx makes it due; a past until makes it due now. Use database time for until,
-// as the claim query compares it with NOW(). Like Heartbeat it acts only on the
-// claim job describes, and returns ErrJobNotFound once that claim is gone.
+// without counting the attempt against the job: it raises the job's MaxAttempts by
+// one, so attempt numbers keep increasing and keep identifying claims. A zero until
+// parks the job until WakeTx makes it due; a past until makes it due now. Use
+// database time for until, as the claim query compares it with NOW(). Like
+// Heartbeat it acts only on the claim job describes, and returns ErrJobNotFound
+// once that claim is gone.
 func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, job Job, until time.Time) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
@@ -32,7 +35,7 @@ func (c *Client) SnoozeTx(ctx context.Context, tx *sql.Tx, job Job, until time.T
 		`WITH snoozed AS (
 			UPDATE pgqueue_jobs
 			SET status = 'pending',
-			    attempts = GREATEST(attempts - 1, 0),
+			    max_attempts = max_attempts + 1,
 			    available_at = GREATEST($2::timestamptz, NOW()),
 			    claimed_by = NULL,
 			    claimed_at = NULL,
@@ -79,6 +82,30 @@ func (c *Client) WakeTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	}
 	if _, err := countRows(rows); err != nil {
 		return fmt.Errorf("pgqueue: wake: %w", err)
+	}
+	return nil
+}
+
+// LockClaimTx locks the row of the job a handler holds, as long as that claim is
+// still held, so neither the reaper nor another worker can take it until tx ends.
+// It returns ErrJobNotFound once the claim is gone.
+func (c *Client) LockClaimTx(ctx context.Context, tx *sql.Tx, job Job) error {
+	if c == nil || c.db == nil {
+		return ErrNilDB
+	}
+	if tx == nil {
+		return fmt.Errorf("pgqueue: tx is nil")
+	}
+	var held bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT TRUE FROM pgqueue_jobs WHERE id = $1 AND status = 'processing' AND attempts = $2 FOR UPDATE`,
+		job.ID, job.Attempts,
+	).Scan(&held)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("pgqueue: lock claim id=%d: %w", job.ID, ErrJobNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("pgqueue: lock claim: %w", err)
 	}
 	return nil
 }

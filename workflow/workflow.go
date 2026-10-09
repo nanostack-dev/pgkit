@@ -33,11 +33,12 @@ type definition struct {
 }
 
 // Define names a workflow function. The name identifies its runs in the database:
-// renaming a workflow strands its unfinished runs. Define panics on an empty name or
-// a nil function, as both are programming errors.
+// renaming a workflow strands its unfinished runs. Names must not contain '@', which
+// separates a name from its Version in queue names. Define panics on an invalid name
+// or a nil function, as both are programming errors.
 func Define[In, Out any](name string, run func(wf *Context, input In) (Out, error), options ...DefineOption) *Workflow[In, Out] {
-	if strings.TrimSpace(name) == "" {
-		panic("workflow: Define needs a name")
+	if strings.TrimSpace(name) == "" || strings.Contains(name, "@") {
+		panic(fmt.Sprintf("workflow: Define(%q) needs a non-empty name without '@'", name))
 	}
 	if run == nil {
 		panic(fmt.Sprintf("workflow: Define(%q) needs a function", name))
@@ -56,6 +57,9 @@ func Define[In, Out any](name string, run func(wf *Context, input In) (Out, erro
 			return nil, err
 		}
 		encoded, err := json.Marshal(output)
+		if err == nil {
+			err = checkStorable(encoded)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("workflow: encode %T output: %w", output, err)
 		}

@@ -168,6 +168,7 @@ func TestNewRefusesANilQueue(t *testing.T) {
 
 func TestDefineRefusesAnEmptyNameOrFunction(t *testing.T) {
 	requirePanic(t, "empty name", func() { Define("", func(*Context, int) (int, error) { return 0, nil }) })
+	requirePanic(t, "name with @", func() { Define("billing@1", func(*Context, int) (int, error) { return 0, nil }) })
 	requirePanic(t, "nil function", func() { Define[int, int]("nil", nil) })
 }
 
@@ -255,5 +256,29 @@ func TestStatusFinished(t *testing.T) {
 		if status.Finished() != finished {
 			t.Fatalf("%s.Finished() = %v", status, status.Finished())
 		}
+	}
+}
+
+func TestPurgeDeletesWholeTreesAndKeepsChildrenOfRetainedParents(t *testing.T) {
+	h := newHarness(t)
+	failing := Define("purge-child", func(wf *Context, _ struct{}) (int, error) { return 0, errors.New("child failed") })
+	parent := Define("purge-parent", func(wf *Context, _ struct{}) (int, error) {
+		return wf.Call("child", failing, struct{}{})
+	})
+	h.startWorker(parent, failing)
+	run := mustStart(h, parent, struct{}{})
+	awaitFailure(h, run)
+	childID := h.step(run.ID, "child").ChildRunID
+	h.exec(`UPDATE pgworkflow_runs SET completed_at = NOW() - interval '31 days' WHERE id = $1`, childID)
+
+	deleted, err := h.client.Purge(h.ctx, PurgeParams{OlderThan: 30 * 24 * time.Hour})
+	if err != nil || deleted != 0 {
+		t.Fatalf("purged %d runs (err %v) while the parent is retained", deleted, err)
+	}
+	h.exec(`UPDATE pgworkflow_runs SET completed_at = NOW() - interval '31 days' WHERE id = $1`, run.ID)
+
+	deleted, err = h.client.Purge(h.ctx, PurgeParams{OlderThan: 30 * 24 * time.Hour})
+	if err != nil || deleted != 2 {
+		t.Fatalf("purged %d runs (err %v), want the parent and its child", deleted, err)
 	}
 }

@@ -25,6 +25,8 @@ var (
 	ErrInvalidOffset = errors.New("pgqueue: offset must be non-negative")
 	ErrSearchTooLong = errors.New("pgqueue: search query is too long")
 	ErrJobBusy       = errors.New("pgqueue: job is currently processing")
+
+	ErrInvalidVisibilityTimeout = errors.New("pgqueue: visibility timeout must be positive")
 )
 
 // ---------------------------------------------------------------------------
@@ -663,10 +665,14 @@ type ReapParams struct {
 }
 
 // Reap reclaims stuck jobs as ReapParams selects them. Jobs with remaining attempts
-// are requeued to pending; exhausted jobs are failed.
+// are requeued to pending; exhausted jobs are failed. VisibilityTimeout must be
+// positive.
 func (c *Client) Reap(ctx context.Context, p ReapParams) (ReapResult, error) {
 	if c == nil || c.db == nil {
 		return ReapResult{}, ErrNilDB
+	}
+	if p.VisibilityTimeout <= 0 {
+		return ReapResult{}, ErrInvalidVisibilityTimeout
 	}
 	var queueNames any
 	if len(p.QueueNames) > 0 {

@@ -345,6 +345,9 @@ func (a *activation) execute(workerCtx context.Context) error {
 		} else {
 			output, err = a.executeFunction()
 		}
+		if a.deadline.passed() {
+			a.recordStop(timedOut, errRunTimedOut)
+		}
 		if reason, _ := a.stopState(); reason == infrastructureFailed && a.runCtx.Err() != nil {
 			a.recordStop(a.interruptionReason())
 		}
@@ -523,12 +526,20 @@ func anyConditionMet(ctx context.Context, tx *sql.Tx, runID string, conditions [
 	if len(conditions) == 0 {
 		return true, nil
 	}
-	signals, children := []string{}, []string{}
+	type awaitedSignal struct {
+		Name     string     `json:"name"`
+		Deadline *time.Time `json:"deadline"`
+	}
+	signals, children := []awaitedSignal{}, []string{}
 	var earliest time.Time
 	for _, condition := range conditions {
 		switch {
 		case condition.signal != "":
-			signals = append(signals, condition.signal)
+			awaited := awaitedSignal{Name: condition.signal}
+			if condition.wake.isSet() {
+				awaited.Deadline = &condition.wake.at
+			}
+			signals = append(signals, awaited)
 		case condition.childRunID != "":
 			children = append(children, condition.childRunID)
 		}
@@ -545,9 +556,11 @@ func anyConditionMet(ctx context.Context, tx *sql.Tx, runID string, conditions [
 	var met bool
 	err := tx.QueryRowContext(ctx, `
 SELECT EXISTS (
-           SELECT 1 FROM pgworkflow_signals
-           WHERE run_id = $1 AND received_by IS NULL
-             AND name IN (SELECT jsonb_array_elements_text($2::jsonb)))
+           SELECT 1 FROM pgworkflow_signals signal
+           JOIN jsonb_to_recordset($2::jsonb) AS awaited(name text, deadline timestamptz)
+             ON awaited.name = signal.name
+           WHERE signal.run_id = $1 AND signal.received_by IS NULL
+             AND (awaited.deadline IS NULL OR signal.created_at <= awaited.deadline))
     OR EXISTS (
            SELECT 1 FROM pgworkflow_runs
            WHERE id IN (SELECT jsonb_array_elements_text($3::jsonb))
@@ -710,13 +723,15 @@ func (a *activation) finish(update func(ctx context.Context, tx *sql.Tx) error, 
 	if status != RunRunning {
 		return queue.Handled()
 	}
+	if err := a.client.queue.LockClaimTx(ctx, tx, a.job); errors.Is(err, queue.ErrJobNotFound) {
+		return queue.Handled()
+	} else if err != nil {
+		return err
+	}
 	if err := update(ctx, tx); err != nil {
 		return fmt.Errorf("workflow: finish run: %w", err)
 	}
 	if err := a.client.queue.AckTx(ctx, tx, a.job.ID); err != nil {
-		if errors.Is(err, queue.ErrJobNotFound) {
-			return queue.Handled()
-		}
 		return err
 	}
 	if err := a.client.queue.NotifyTx(ctx, tx, runNotifyKey(a.runID)); err != nil {

@@ -29,6 +29,8 @@ func (c *Client) Subscribe(keys ...string) (*Subscription, error) {
 }
 
 // Wake receives a value after one or more notifications; several collapse into one.
+// The channel is never closed, not even by Close: select on it with your own
+// cancellation instead of ranging over it.
 func (s *Subscription) Wake() <-chan struct{} {
 	return s.sub.wake
 }

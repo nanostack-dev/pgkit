@@ -125,8 +125,9 @@ RETURNING `+checkpointColumns, absolute, duration.Seconds())
 
 // Receive returns the next signal of its kind sent to the run, waiting at most
 // timeout from the first time the run reaches this receive. It returns ErrTimeout
-// when none arrives in time; pass Forever to wait without a timeout. Signals sent
-// before the run waits are kept in order, each received once.
+// when none arrives in time, even if one arrives later while the run is still
+// parked; pass Forever to wait without a timeout. Signals sent before the run waits
+// are kept in order, each received once.
 func (wf *Context) Receive[T any](signal Signal[T], timeout time.Duration) (T, error) {
 	var zero T
 	act := wf.act
@@ -373,6 +374,9 @@ func encodeResult[T any](value T) (json.RawMessage, T, error) {
 	if err := json.Unmarshal(output, &recorded); err != nil {
 		return nil, recorded, NonRetryable(fmt.Errorf("%T result does not decode from its own JSON: %w", value, err))
 	}
+	if err := checkStorable(output); err != nil {
+		return nil, recorded, NonRetryable(fmt.Errorf("%T result %w", value, err))
+	}
 	return output, recorded, nil
 }
 
@@ -567,6 +571,7 @@ func (a *activation) receiveSignal(key string, cp checkpoint) (json.RawMessage, 
 WITH next AS (
     SELECT id, payload FROM pgworkflow_signals
     WHERE run_id = $1 AND name = $3 AND received_by IS NULL
+      AND ($4::timestamptz IS NULL OR created_at <= $4)
     ORDER BY id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -579,7 +584,7 @@ UPDATE pgworkflow_steps
 SET status = 'succeeded', output = received.payload, completed_at = NOW(), updated_at = NOW()
 FROM received
 WHERE run_id = $1 AND name = $2
-RETURNING received.payload`, a.runID, key, cp.signal).Scan(&payload)
+RETURNING received.payload`, a.runID, key, cp.signal, receiveDeadline(cp)).Scan(&payload)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -593,6 +598,15 @@ RETURNING received.payload`, a.runID, key, cp.signal).Scan(&payload)
 	return payload, true, nil
 }
 
+// receiveDeadline is the latest time a signal may have been sent and still be
+// received, or nil for a receive without timeout.
+func receiveDeadline(cp checkpoint) any {
+	if !cp.wake.isSet() {
+		return nil
+	}
+	return cp.wake.at
+}
+
 func (a *activation) startChild(key string, child *definition, input any, config startConfig) error {
 	if err := a.stopped(); err != nil {
 		return err
@@ -602,6 +616,9 @@ func (a *activation) startChild(key string, child *definition, input any, config
 		return err
 	}
 	encodedInput, err := json.Marshal(input)
+	if err == nil {
+		err = checkStorable(encodedInput)
+	}
 	if err != nil {
 		return fmt.Errorf("workflow: encode %T input of child %q: %w", input, key, err)
 	}
@@ -640,6 +657,9 @@ func awaitChild[Out any](act *activation, key string) (Out, error) {
 		ctx, cancel := act.bookkeepingContext()
 		child, err := act.client.GetRun(ctx, cp.childRunID)
 		cancel()
+		if errors.Is(err, ErrRunNotFound) {
+			return zero, act.nonDeterminism(fmt.Errorf("%w: child run %s of %q no longer exists", ErrNonDeterministic, cp.childRunID, key))
+		}
 		if err != nil {
 			return zero, act.infrastructureFailure(err)
 		}

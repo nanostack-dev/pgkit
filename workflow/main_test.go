@@ -461,3 +461,30 @@ func (g *gate) release() {
 func queueListParams() queue.ListJobsParams {
 	return queue.ListJobsParams{Limit: 100}
 }
+
+// mustFail awaits a run that must fail and returns its error.
+func mustFail[Out any](h *harness, run Run[Out]) *RunError {
+	h.t.Helper()
+	_, err := result(h, run)
+	runErr := requireRunError(h.t, err)
+	if runErr.Status != RunFailed {
+		h.t.Fatalf("run status = %s, want failed", runErr.Status)
+	}
+	return runErr
+}
+
+// awaitFailure awaits a run that must fail.
+func awaitFailure[Out any](h *harness, run Run[Out]) {
+	h.t.Helper()
+	_, err := result(h, run)
+	requireFailed(h.t, err)
+}
+
+func (h *harness) requireStep(runID, name string, status StepStatus, attempts int) StepInfo {
+	h.t.Helper()
+	step := h.step(runID, name)
+	if step.Status != status || step.Attempts != attempts {
+		h.t.Fatalf("step %q = %s after %d attempt(s), want %s after %d", name, step.Status, step.Attempts, status, attempts)
+	}
+	return step
+}

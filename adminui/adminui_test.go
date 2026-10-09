@@ -326,3 +326,73 @@ func requireEventually(t *testing.T, timeout, interval time.Duration, fn func() 
 	}
 	t.Fatal("condition not met in time")
 }
+
+func TestAdminUIProtectsMutations(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+	queue, _ := newClients(t, ctx, db)
+	server := newServer(t, queue, Options{Token: "secret"})
+	host := strings.TrimPrefix(server.URL, "http://")
+	enqueue := func(user, password string, headers map[string]string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/api/dashboard/queue/jobs", strings.NewReader(`{"queue_name":"guarded","payload":{}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user != "" {
+			req.SetBasicAuth(user, password)
+		}
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	cases := []struct {
+		name     string
+		user     string
+		password string
+		headers  map[string]string
+		want     int
+	}{
+		{"no credentials", "", "", map[string]string{"X-Requested-With": "pgkit-admin-ui"}, http.StatusUnauthorized},
+		{"wrong token", "admin", "wrong", map[string]string{"X-Requested-With": "pgkit-admin-ui"}, http.StatusUnauthorized},
+		{"no CSRF proof", "admin", "secret", nil, http.StatusForbidden},
+		{"origin containing the host", "admin", "secret", map[string]string{"Origin": "http://" + host + ".evil.example"}, http.StatusForbidden},
+		{"other origin", "admin", "secret", map[string]string{"Origin": "https://evil.example"}, http.StatusForbidden},
+		{"same origin", "admin", "secret", map[string]string{"Origin": server.URL}, http.StatusCreated},
+		{"admin UI header", "admin", "secret", map[string]string{"X-Requested-With": "pgkit-admin-ui"}, http.StatusCreated},
+	}
+	for _, tc := range cases {
+		if got := enqueue(tc.user, tc.password, tc.headers); got != tc.want {
+			t.Fatalf("%s: status %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	jobs, err := queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1, QueueName: "guarded"})
+	if err != nil || jobs != 2 {
+		t.Fatalf("guarded jobs = %d (err %v), want only the two accepted mutations", jobs, err)
+	}
+}
+
+func TestAdminUIHidesServerErrorDetails(t *testing.T) {
+	ctx := context.Background()
+	db := createTestDB(t, ctx)
+	queue, workflows := newClients(t, ctx, db)
+	server := newServer(t, queue, Options{Token: "secret", Workflow: workflows})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/api/dashboard/snapshot", "/api/dashboard/workflow/runs", "/api/dashboard/workflow/runs/any"} {
+		var body map[string]string
+		getJSON(t, server.URL+path, http.StatusInternalServerError, &body)
+		if body["error"] != "Internal Server Error" {
+			t.Fatalf("%s leaked %q", path, body["error"])
+		}
+	}
+}

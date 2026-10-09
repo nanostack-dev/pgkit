@@ -142,8 +142,24 @@ func TestARunTimeoutInterruptsTheRunningStep(t *testing.T) {
 		})
 	})
 	h.startWorker(flow)
-	run := mustStart(h, flow, struct{}{}, Timeout(500*time.Millisecond))
+	run := mustStart(h, flow, struct{}{}, Timeout(3*time.Second))
 	reached.awaitReached(t)
+
+	_, err := result(h, run)
+
+	requireErrorIs(t, err, ErrTimeout)
+}
+
+func TestARunPastItsTimeoutFailsEvenWhenItsStepIgnoresTheContext(t *testing.T) {
+	h := newHarness(t)
+	flow := Define("overrun", func(wf *Context, _ struct{}) (int, error) {
+		return wf.Step("stubborn", func(ctx context.Context) (int, error) {
+			<-ctx.Done()
+			return 1, nil
+		})
+	})
+	h.startWorker(flow)
+	run := mustStart(h, flow, struct{}{}, Timeout(300*time.Millisecond))
 
 	_, err := result(h, run)
 

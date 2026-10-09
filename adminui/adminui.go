@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -638,13 +639,24 @@ func (u *UI) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		origin := r.Header.Get("Origin")
-		if origin != "" && strings.Contains(origin, r.Host) {
+		if sameOrigin(r) {
 			next(w, r)
 			return
 		}
 		http.Error(w, "forbidden: missing CSRF token", http.StatusForbidden)
 	}
+}
+
+// sameOrigin reports whether the request's Origin header names this server's host
+// exactly; a host that merely contains it, like admin.example.com.evil.example,
+// does not count.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
 }
 
 func queryInt(r *http.Request, key string, fallback int) int {

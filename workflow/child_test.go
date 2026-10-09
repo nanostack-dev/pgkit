@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -53,10 +54,26 @@ func TestAChildRunIsLinkedToItsParent(t *testing.T) {
 
 func TestStartFansOutToChildrenThatRunConcurrently(t *testing.T) {
 	h := newHarness(t)
+	const children = 4
+	var entered sync.WaitGroup
+	entered.Add(children)
+	allEntered := make(chan struct{})
+	go func() { entered.Wait(); close(allEntered) }()
+	rendezvous := Define("rendezvous-child", func(wf *Context, n int) (int, error) {
+		return wf.Step("meet", func(ctx context.Context) (int, error) {
+			entered.Done()
+			select {
+			case <-allEntered:
+				return n * 2, nil
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}, NoRetry, Timeout(20*time.Second))
+	})
 	parent := Define("fan-out", func(wf *Context, numbers []int) (int, error) {
 		var futures []*Future[int]
 		for _, n := range numbers {
-			futures = append(futures, wf.Start("double", double, n))
+			futures = append(futures, wf.Start("double", rendezvous, n))
 		}
 		sum := 0
 		for _, future := range futures {
@@ -68,13 +85,13 @@ func TestStartFansOutToChildrenThatRunConcurrently(t *testing.T) {
 		}
 		return sum, nil
 	})
-	h.startWorker(parent, double)
-	run := mustStart(h, parent, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	h.startWorkerWith(workerOptions{config: WorkerConfig{Concurrency: children + 1}}, parent, rendezvous)
+	run := mustStart(h, parent, []int{1, 2, 3, 4})
 
-	if got := mustResult(h, run); got != 110 {
+	if got := mustResult(h, run); got != 20 {
 		t.Fatalf("sum = %d", got)
 	}
-	if got := h.queryInt(`SELECT count(*) FROM pgworkflow_runs WHERE parent_run_id = $1`, run.ID); got != 10 {
+	if got := h.queryInt(`SELECT count(*) FROM pgworkflow_runs WHERE parent_run_id = $1`, run.ID); got != children {
 		t.Fatalf("children = %d", got)
 	}
 }

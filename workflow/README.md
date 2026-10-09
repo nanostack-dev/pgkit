@@ -89,8 +89,9 @@ that no longer decodes, fails the run with `ErrNonDeterministic`.
 - **Waits shorter than a second** happen in process instead of parking.
 - **Signals** are typed messages declared once with `NewSignal[T](name)` and shared
   by `Client.Signal` and `Context.Receive`. A signal sent before the run waits is
-  kept; signals of one kind are received once each, in the order sent. Pass
-  `workflow.Forever` to wait without a timeout and `0` to check once.
+  kept; signals of one kind are received once each, in the order sent. A signal
+  sent after a receive's timeout does not count for it, even if the run was still
+  parked. Pass `workflow.Forever` to wait without a timeout and `0` to check once.
 - **Children** run on whichever worker lists their workflow. Their key is the
   parent's run ID and step name, so a replay never starts them twice. Failing or
   cancelling a parent cancels its unfinished children.
@@ -110,7 +111,7 @@ Options are typed values. Zero fields take defaults.
 | `workflow.NoRetry` | steps | One attempt. |
 | `workflow.Timeout(d)` | steps, `Start`, child `Start`/`Call` | Bounds one step attempt, or a whole run. A run past its timeout fails; `errors.Is(err, workflow.ErrTimeout)` reports it. |
 | `workflow.Key(k)` | `Start` | Idempotent start: a run of the workflow with that key is returned instead of starting another, whatever its status. Children are keyed by their step name and refuse a `Key`. |
-| `workflow.Version(n)` | `Define` | Separates incompatible versions; see [Changing a workflow](#changing-a-workflow). |
+| `workflow.Version(n)` | `Define` | Separates incompatible versions; see [Changing a workflow](#changing-a-workflow). Workflow names cannot contain `@`. |
 
 Step functions receive a `context.Context` bounded by `Timeout` and cancelled when
 the run is cancelled, times out or moves to another worker. `workflow.IdempotencyKey(ctx)`
@@ -130,6 +131,11 @@ external APIs so a repeated attempt does not repeat their effect.
   tell cancellation and timeouts apart.
 - A panic in a step is a failed attempt; a panic in the workflow function fails the
   run.
+- A run past its `Timeout` fails with `ErrTimeout`, even if its last step finished
+  after the deadline.
+- Values holding a NUL character (`\u0000`) cannot be stored in PostgreSQL JSONB: a
+  step result with one fails the step without retry, and `Start` or `Signal` with
+  one returns an error.
 - Database errors while recording are not step failures: the activation stops and
   the queue retries it, and the run replays from its checkpoints.
 
@@ -160,7 +166,7 @@ err = client.Retry(ctx, runID)                          // resume a failed or ca
 info, err := client.GetRun(ctx, runID)
 steps, err := client.ListSteps(ctx, runID)
 runs, err := client.ListRuns(ctx, workflow.ListRunsParams{Status: workflow.RunFailed})
-deleted, err := client.Purge(ctx, workflow.PurgeParams{OlderThan: 30 * 24 * time.Hour})
+deleted, err := client.Purge(ctx, workflow.PurgeParams{OlderThan: 30 * 24 * time.Hour}) // whole finished trees
 ```
 
 `Retry` keeps completed checkpoints, starts failed and interrupted steps over with
@@ -236,12 +242,15 @@ key run and name) and `pgworkflow_signals`, created by `EnsureSchema`
 ([schema.go](schema.go)).
 
 - **One job per run.** Each run owns one queue job (`runs.job_id`) on the queue
-  `pgworkflow:<name>` or `pgworkflow:<name>@<version>`. A parked run snoozes the job
-  (`queue.SnoozeTx`, attempt refunded) until its earliest wake time, or until woken.
+  `pgworkflow:<name>` or `pgworkflow:<name>@<version>` (names cannot contain `@`). A
+  parked run snoozes the job (`queue.SnoozeTx`, attempt not counted) until its
+  earliest wake time, or until woken.
   Signals, child completions and cancellations make it due with `queue.WakeTx`,
   which notifies at commit.
 - **Activations and fencing.** Claiming the job starts an activation, which bumps
-  `runs.lease`. Every checkpoint write runs in a transaction that share-locks the
+  `runs.lease` while holding the job's claim (`queue.LockClaimTx`), so a worker whose
+  claim the reaper took back cannot displace the current one; finishing holds the
+  claim too. Every checkpoint write runs in a transaction that share-locks the
   run row and checks the lease and the `running` status ([activation.go](activation.go)),
   so a worker that lost the run cannot write, and a takeover waits for an in-flight
   write. Snoozes are fenced by the job's attempt number.
@@ -266,8 +275,9 @@ key run and name) and `pgworkflow_signals`, created by `EnsureSchema`
 - **Shutdown.** Workers claim and settle jobs on contexts shutdown does not cancel,
   hand back jobs claimed while stopping, record steps that finished, and refund an
   interrupted attempt.
-- **Reconciling.** Each worker periodically fails unfinished runs whose job the
-  queue gave up on (attempts exhausted by crashes or reaps).
+- **Reconciling.** Each worker periodically fails unfinished runs no activation can
+  finish: their job failed (attempts exhausted by crashes or reaps), was settled
+  outside the runtime, or was deleted. `OnRunFailed` is called for them too.
 
 The queue primitives this relies on are documented with the queue in the
 [repository README](../README.md).

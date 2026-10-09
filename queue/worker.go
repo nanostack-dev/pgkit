@@ -455,8 +455,8 @@ func (w *Worker) claim(workerCtx context.Context, queueName string) (*Job, bool,
 	return w.client.Claim(ctx, queueName, w.cfg.WorkerID)
 }
 
-// handBack returns a job claimed as the worker began stopping, due now and with its
-// attempt refunded, so another worker takes it without waiting for the reaper.
+// handBack returns a job claimed as the worker began stopping, due now and without
+// counting the attempt, so another worker takes it without waiting for the reaper.
 func (w *Worker) handBack(workerCtx context.Context, job *Job) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
 	defer cancel()
@@ -510,7 +510,11 @@ func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
 // reap requeues stuck jobs of the worker's own queues only: its visibility timeout
 // says nothing about how long other queues' jobs may take.
 func (w *Worker) reap(ctx context.Context) error {
-	result, err := w.client.Reap(ctx, ReapParams{VisibilityTimeout: w.cfg.VisibilityTimeout, QueueNames: w.registry.queueNames()})
+	queueNames := w.registry.queueNames()
+	if len(queueNames) == 0 {
+		return nil
+	}
+	result, err := w.client.Reap(ctx, ReapParams{VisibilityTimeout: w.cfg.VisibilityTimeout, QueueNames: queueNames})
 	if err != nil {
 		return err
 	}
