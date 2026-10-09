@@ -1,1 +1,0 @@
-import{B as e,C as t,i as n,o as r,v as i,w as a}from"./B1gQfmuU.js";import{t as o}from"./Cwe57lPt.js";function s(s,c){let l=n(c,[`children`,`$$slots`,`$$events`,`$$legacy`]),u=[[`path`,{d:`m9 18 6-6-6-6`}]];o(s,r({name:`chevron-right`},()=>l,{get iconNode(){return u},children:(n,r)=>{var o=a();i(e(o),c,`default`,{},null),t(n,o)},$$slots:{default:!0}}))}export{s as t};

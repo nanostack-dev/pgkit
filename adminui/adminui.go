@@ -1,6 +1,7 @@
 package adminui
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"database/sql"
@@ -28,6 +29,8 @@ const (
 	maxListLimit                 = 100
 	requestHeaderRequestedWith   = "X-Requested-With"
 	requestHeaderRequestedWithUI = "pgkit-admin-ui"
+	cacheControlImmutable        = "public, max-age=31536000, immutable"
+	cacheControlRevalidate       = "no-cache"
 )
 
 var ErrMissingToken = errors.New("pgkit adminui: missing dashboard token")
@@ -38,7 +41,7 @@ type UI struct {
 	token           string
 	enableMutations bool
 	listLimit       int
-	assets          fs.FS
+	assets          *staticAssets
 	server          *http.Server
 }
 
@@ -68,6 +71,7 @@ type queueJob struct {
 	Status         string  `json:"status"`
 	Attempts       int     `json:"attempts"`
 	MaxAttempts    int     `json:"max_attempts"`
+	Claims         int     `json:"claims"`
 	AvailableAt    string  `json:"available_at"`
 	ClaimedBy      *string `json:"claimed_by"`
 	ClaimedAt      *string `json:"claimed_at"`
@@ -112,12 +116,6 @@ type workflowStep struct {
 	UpdatedAt   string  `json:"updated_at"`
 }
 
-type workflowRunDetail struct {
-	Run      workflowRun    `json:"run"`
-	Steps    []workflowStep `json:"steps"`
-	Children []workflowRun  `json:"children"`
-}
-
 type listResponse[T any] struct {
 	Items  []T   `json:"items"`
 	Total  int64 `json:"total"`
@@ -141,6 +139,11 @@ type enqueueRequest struct {
 	Payload      json.RawMessage `json:"payload"`
 	MaxAttempts  int             `json:"max_attempts"`
 	DelaySeconds int             `json:"delay_seconds"`
+}
+
+func (r enqueueRequest) hasPayload() bool {
+	payload := bytes.TrimSpace(r.Payload)
+	return len(payload) > 0 && string(payload) != "null" && string(payload) != `""`
 }
 
 func New(queue *qpkg.Client, opts Options) (*UI, error) {
@@ -191,7 +194,7 @@ func New(queue *qpkg.Client, opts Options) (*UI, error) {
 		token:           token,
 		enableMutations: enableMutations,
 		listLimit:       limit,
-		assets:          assets,
+		assets:          newStaticAssets(assets),
 	}, nil
 }
 
@@ -201,12 +204,19 @@ func NewFromEnv(queue *qpkg.Client, workflows *workflow.Client) (*UI, error) {
 
 func (u *UI) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/dashboard/config", u.requireToken(u.handleConfig))
+	mux.HandleFunc("GET /api/dashboard/overview", u.requireToken(u.handleOverview))
 	mux.HandleFunc("GET /api/dashboard/snapshot", u.requireToken(u.handleSnapshot))
 	mux.HandleFunc("GET /api/dashboard/queue/summary", u.requireToken(u.handleQueueSummary))
+	mux.HandleFunc("GET /api/dashboard/queue/queues", u.requireToken(u.handleQueueQueues))
 	mux.HandleFunc("GET /api/dashboard/queue/jobs", u.requireToken(u.handleQueueJobs))
+	mux.HandleFunc("GET /api/dashboard/queue/jobs/{id}", u.requireToken(u.handleQueueJob))
 	mux.HandleFunc("GET /api/dashboard/queue/locks", u.requireToken(u.handleQueueLocks))
+	mux.HandleFunc("GET /api/dashboard/locks", u.requireToken(u.handleLocks))
+	mux.HandleFunc("GET /api/dashboard/workflow/workflows", u.requireToken(u.handleWorkflowWorkflows))
 	mux.HandleFunc("GET /api/dashboard/workflow/runs", u.requireToken(u.handleWorkflowRuns))
 	mux.HandleFunc("GET /api/dashboard/workflow/runs/{id}", u.requireToken(u.handleWorkflowRun))
+	mux.HandleFunc("GET /api/dashboard/workflow/runs/{id}/tree", u.requireToken(u.handleWorkflowRunTree))
 	if u.enableMutations {
 		mux.HandleFunc("POST /api/dashboard/queue/jobs", u.requireToken(u.requireCSRF(u.handleEnqueueJob)))
 		mux.HandleFunc("POST /api/dashboard/queue/jobs/{id}/replay", u.requireToken(u.requireCSRF(u.handleReplayJob)))
@@ -214,16 +224,16 @@ func (u *UI) Handler() http.Handler {
 		mux.HandleFunc("POST /api/dashboard/workflow/runs/{id}/retry", u.requireToken(u.requireCSRF(u.handleRetryWorkflowRun)))
 		mux.HandleFunc("POST /api/dashboard/workflow/runs/{id}/cancel", u.requireToken(u.requireCSRF(u.handleCancelWorkflowRun)))
 	}
-	fileServer := http.FileServer(http.FS(u.assets))
-	mux.Handle("GET /_app/", u.requireToken(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fileServer.ServeHTTP(w, r)
-	})))
+	mux.HandleFunc("GET /_app/", u.requireToken(func(w http.ResponseWriter, r *http.Request) {
+		u.assets.serve(w, r, strings.TrimPrefix(path.Clean(r.URL.Path), "/"), cacheControlImmutable)
+	}))
 	mux.HandleFunc("GET /", u.requireToken(u.handleSPA))
 	mux.HandleFunc("GET /queues", u.requireToken(u.handleSPA))
+	mux.HandleFunc("GET /locks", u.requireToken(u.handleSPA))
 	mux.HandleFunc("GET /workflows", u.requireToken(u.handleSPA))
 	mux.HandleFunc("GET /workflows/{id}", u.requireToken(u.handleSPA))
 	mux.HandleFunc("GET /favicon.ico", u.requireToken(u.handleAsset))
-	return mux
+	return withNoSniff(mux)
 }
 
 func (u *UI) ListenAndServe(addr string) error {
@@ -286,13 +296,23 @@ func (u *UI) handleQueueSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) handleQueueJobs(w http.ResponseWriter, r *http.Request) {
-	params := qpkg.ListJobsParams{
-		Limit:     queryInt(r, "limit", u.listLimit),
-		Offset:    queryInt(r, "offset", 0),
-		QueueName: strings.TrimSpace(r.URL.Query().Get("queue")),
-		Search:    strings.TrimSpace(r.URL.Query().Get("search")),
+	page, err := u.pageRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
-	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
+	search, err := searchTerm(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	params := qpkg.ListJobsParams{
+		Limit:     page.limit,
+		Offset:    page.offset,
+		QueueName: queryText(r, "queue"),
+		Search:    search,
+	}
+	if status := queryText(r, "status"); status != "" {
 		params.Status = qpkg.JobStatus(status)
 	}
 	jobs, err := u.buildQueueJobs(r.Context(), params)
@@ -312,56 +332,33 @@ func (u *UI) handleQueueLocks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, locks)
 }
 
-func (u *UI) handleWorkflowRuns(w http.ResponseWriter, r *http.Request) {
-	if u.workflow == nil {
-		writeJSON(w, http.StatusOK, listResponse[workflowRun]{Items: []workflowRun{}, Total: 0, Limit: queryInt(r, "limit", u.listLimit), Offset: queryInt(r, "offset", 0)})
-		return
-	}
-	params := workflow.ListRunsParams{
-		Workflow:    strings.TrimSpace(r.URL.Query().Get("workflow")),
-		ParentRunID: strings.TrimSpace(r.URL.Query().Get("parent_run_id")),
-		Search:      strings.TrimSpace(r.URL.Query().Get("search")),
-		Limit:       queryInt(r, "limit", u.listLimit),
-		Offset:      queryInt(r, "offset", 0),
-	}
-	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
-		params.Status = workflow.RunStatus(status)
-	}
-	response, err := u.buildWorkflowRuns(r.Context(), params)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
-func (u *UI) handleWorkflowRun(w http.ResponseWriter, r *http.Request) {
-	if u.workflow == nil {
-		http.NotFound(w, r)
-		return
-	}
-	detail, err := u.buildWorkflowRunDetail(r.Context(), strings.TrimSpace(r.PathValue("id")))
-	if err != nil {
-		writeWorkflowError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, detail)
-}
-
 func (u *UI) handleEnqueueJob(w http.ResponseWriter, r *http.Request) {
 	var request enqueueRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %w", err))
+		writeError(w, http.StatusBadRequest, errInvalidBody)
 		return
 	}
-	params := qpkg.EnqueueParams{QueueName: strings.TrimSpace(request.QueueName), Payload: request.Payload, MaxAttempts: request.MaxAttempts}
+	queueName := strings.TrimSpace(request.QueueName)
+	if queueName == "" {
+		writeError(w, http.StatusBadRequest, errQueueRequired)
+		return
+	}
+	if !request.hasPayload() {
+		writeError(w, http.StatusBadRequest, errPayloadRequired)
+		return
+	}
+	params := qpkg.EnqueueParams{QueueName: queueName, Payload: request.Payload, MaxAttempts: request.MaxAttempts}
 	if request.DelaySeconds > 0 {
 		at := time.Now().UTC().Add(time.Duration(request.DelaySeconds) * time.Second)
 		params.AvailableAt = &at
 	}
 	id, err := u.queue.Enqueue(r.Context(), params)
+	if errors.Is(err, qpkg.ErrInvalidQueue) {
+		writeError(w, http.StatusBadRequest, errQueueRequired)
+		return
+	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
@@ -370,20 +367,16 @@ func (u *UI) handleEnqueueJob(w http.ResponseWriter, r *http.Request) {
 func (u *UI) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 	id, ok := parsePathID(r.PathValue("id"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid job id"))
+		writeError(w, http.StatusBadRequest, errInvalidJobID)
 		return
 	}
 	if err := u.queue.ReplayJob(r.Context(), id); err != nil {
-		status := http.StatusConflict
-		if errors.Is(err, qpkg.ErrJobNotFound) {
-			status = http.StatusNotFound
-		}
-		writeError(w, status, err)
+		writeJobMutationError(w, err, errNotReplayable)
 		return
 	}
 	job, err := u.queue.GetJob(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeJobMutationError(w, err, errJobNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, toQueueJob(*job))
@@ -392,18 +385,25 @@ func (u *UI) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 func (u *UI) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	id, ok := parsePathID(r.PathValue("id"))
 	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid job id"))
+		writeError(w, http.StatusBadRequest, errInvalidJobID)
 		return
 	}
 	if err := u.queue.DeleteJob(r.Context(), id); err != nil {
-		status := http.StatusConflict
-		if errors.Is(err, qpkg.ErrJobNotFound) {
-			status = http.StatusNotFound
-		}
-		writeError(w, status, err)
+		writeJobMutationError(w, err, errJobNotFound)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeJobMutationError(w http.ResponseWriter, err error, notFound error) {
+	switch {
+	case errors.Is(err, qpkg.ErrJobNotFound):
+		writeError(w, http.StatusNotFound, notFound)
+	case errors.Is(err, qpkg.ErrJobBusy):
+		writeError(w, http.StatusConflict, errJobBusy)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func (u *UI) handleRetryWorkflowRun(w http.ResponseWriter, r *http.Request) {
@@ -435,64 +435,22 @@ func (u *UI) mutateWorkflowRun(w http.ResponseWriter, r *http.Request, mutate fu
 func writeWorkflowError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, workflow.ErrRunNotFound):
-		writeError(w, http.StatusNotFound, err)
-	case errors.Is(err, workflow.ErrRunNotRetryable), errors.Is(err, workflow.ErrRunFinished):
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusNotFound, errRunNotFound)
+	case errors.Is(err, workflow.ErrRunNotRetryable):
+		writeError(w, http.StatusConflict, workflow.ErrRunNotRetryable)
+	case errors.Is(err, workflow.ErrRunFinished):
+		writeError(w, http.StatusConflict, workflow.ErrRunFinished)
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}
 }
 
-func (u *UI) handleSPA(w http.ResponseWriter, _ *http.Request) {
-	u.serveAsset(w, "index.html", "text/html; charset=utf-8")
+func (u *UI) handleSPA(w http.ResponseWriter, r *http.Request) {
+	u.assets.serve(w, r, "index.html", cacheControlRevalidate)
 }
 
 func (u *UI) handleAsset(w http.ResponseWriter, r *http.Request) {
-	u.serveAsset(w, strings.TrimPrefix(path.Clean(r.URL.Path), "/"), "")
-}
-
-func (u *UI) serveAsset(w http.ResponseWriter, name, contentType string) {
-	content, err := fs.ReadFile(u.assets, name)
-	if err != nil {
-		http.NotFound(w, &http.Request{})
-		return
-	}
-	if contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	}
-	_, _ = w.Write(content)
-}
-
-func (u *UI) buildQueueSummary(ctx context.Context) (queueSummary, error) {
-	total, err := u.queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1})
-	if err != nil {
-		return queueSummary{}, err
-	}
-	pending, err := u.queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1, Status: qpkg.StatusPending})
-	if err != nil {
-		return queueSummary{}, err
-	}
-	processing, err := u.queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1, Status: qpkg.StatusProcessing})
-	if err != nil {
-		return queueSummary{}, err
-	}
-	done, err := u.queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1, Status: qpkg.StatusDone})
-	if err != nil {
-		return queueSummary{}, err
-	}
-	failed, err := u.queue.CountJobs(ctx, qpkg.ListJobsParams{Limit: 1, Status: qpkg.StatusFailed})
-	if err != nil {
-		return queueSummary{}, err
-	}
-	locks, err := qpkg.ListAdvisoryLocks(ctx, u.queue)
-	if err != nil {
-		return queueSummary{}, err
-	}
-	queues, err := qpkg.CountDistinctQueues(ctx, u.queue)
-	if err != nil {
-		return queueSummary{}, err
-	}
-	return queueSummary{TotalJobs: total, PendingJobs: pending, ProcessingJobs: processing, DoneJobs: done, FailedJobs: failed, AdvisoryLocks: len(locks), Queues: queues}, nil
+	u.assets.serve(w, r, strings.TrimPrefix(path.Clean(r.URL.Path), "/"), "")
 }
 
 func (u *UI) buildQueueJobs(ctx context.Context, params qpkg.ListJobsParams) (listResponse[queueJob], error) {
@@ -509,29 +467,6 @@ func (u *UI) buildQueueJobs(ctx context.Context, params qpkg.ListJobsParams) (li
 		items = append(items, toQueueJob(job))
 	}
 	return listResponse[queueJob]{Items: items, Total: total, Limit: params.Limit, Offset: params.Offset}, nil
-}
-
-func (u *UI) buildWorkflowRunDetail(ctx context.Context, runID string) (workflowRunDetail, error) {
-	run, err := u.workflow.GetRun(ctx, runID)
-	if err != nil {
-		return workflowRunDetail{}, err
-	}
-	steps, err := u.workflow.ListSteps(ctx, runID)
-	if err != nil {
-		return workflowRunDetail{}, err
-	}
-	children, err := u.workflow.ListRuns(ctx, workflow.ListRunsParams{ParentRunID: runID, Limit: maxListLimit})
-	if err != nil {
-		return workflowRunDetail{}, err
-	}
-	detail := workflowRunDetail{Run: toWorkflowRun(run), Steps: make([]workflowStep, 0, len(steps)), Children: make([]workflowRun, 0, len(children))}
-	for _, step := range steps {
-		detail.Steps = append(detail.Steps, toWorkflowStep(step))
-	}
-	for _, child := range children {
-		detail.Children = append(detail.Children, toWorkflowRun(child))
-	}
-	return detail, nil
 }
 
 func (u *UI) buildWorkflowRuns(ctx context.Context, params workflow.ListRunsParams) (listResponse[workflowRun], error) {
@@ -551,20 +486,25 @@ func (u *UI) buildWorkflowRuns(ctx context.Context, params workflow.ListRunsPara
 }
 
 func toQueueJob(job qpkg.Job) queueJob {
+	return newQueueJob(job, qpkg.PayloadPreview(job.Payload))
+}
+
+func newQueueJob(job qpkg.Job, payloadPreview string) queueJob {
 	return queueJob{
 		ID:             job.ID,
 		QueueName:      job.QueueName,
 		Status:         string(job.Status),
 		Attempts:       job.Attempts,
 		MaxAttempts:    job.MaxAttempts,
-		AvailableAt:    job.AvailableAt.Format(time.RFC3339),
+		Claims:         job.Claims,
+		AvailableAt:    formatTime(job.AvailableAt),
 		ClaimedBy:      nullString(job.ClaimedBy),
 		ClaimedAt:      nullTime(job.ClaimedAt),
 		DoneAt:         nullTime(job.DoneAt),
 		LastError:      nullString(job.LastError),
-		PayloadPreview: qpkg.PayloadPreview(job.Payload),
-		CreatedAt:      job.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:      job.UpdatedAt.Format(time.RFC3339),
+		PayloadPreview: payloadPreview,
+		CreatedAt:      formatTime(job.CreatedAt),
+		UpdatedAt:      formatTime(job.UpdatedAt),
 	}
 }
 
@@ -582,10 +522,10 @@ func toWorkflowRun(run workflow.RunInfo) workflowRun {
 		Output:      optionalString(string(run.Output)),
 		WakeAt:      optionalTime(run.WakeAt),
 		DeadlineAt:  optionalTime(run.DeadlineAt),
-		CreatedAt:   run.CreatedAt.Format(time.RFC3339),
+		CreatedAt:   formatTime(run.CreatedAt),
 		StartedAt:   optionalTime(run.StartedAt),
 		CompletedAt: optionalTime(run.CompletedAt),
-		UpdatedAt:   run.UpdatedAt.Format(time.RFC3339),
+		UpdatedAt:   formatTime(run.UpdatedAt),
 	}
 }
 
@@ -600,9 +540,9 @@ func toWorkflowStep(step workflow.StepInfo) workflowStep {
 		WakeAt:      optionalTime(step.WakeAt),
 		ChildRunID:  optionalString(step.ChildRunID),
 		Signal:      optionalString(step.Signal),
-		CreatedAt:   step.CreatedAt.Format(time.RFC3339),
+		CreatedAt:   formatTime(step.CreatedAt),
 		CompletedAt: optionalTime(step.CompletedAt),
-		UpdatedAt:   step.UpdatedAt.Format(time.RFC3339),
+		UpdatedAt:   formatTime(step.UpdatedAt),
 	}
 }
 
@@ -617,7 +557,7 @@ func optionalTime(value time.Time) *string {
 	if value.IsZero() {
 		return nil
 	}
-	formatted := value.Format(time.RFC3339)
+	formatted := formatTime(value)
 	return &formatted
 }
 
@@ -635,15 +575,11 @@ func (u *UI) requireToken(next http.HandlerFunc) http.HandlerFunc {
 
 func (u *UI) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(requestHeaderRequestedWith) == requestHeaderRequestedWithUI {
+		if r.Header.Get(requestHeaderRequestedWith) == requestHeaderRequestedWithUI || sameOrigin(r) {
 			next(w, r)
 			return
 		}
-		if sameOrigin(r) {
-			next(w, r)
-			return
-		}
-		http.Error(w, "forbidden: missing CSRF token", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, errForbiddenCSRF)
 	}
 }
 
@@ -657,6 +593,13 @@ func sameOrigin(r *http.Request) bool {
 	}
 	parsed, err := url.Parse(origin)
 	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
+}
+
+func withNoSniff(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func queryInt(r *http.Request, key string, fallback int) int {
@@ -702,7 +645,7 @@ func nullTime(v sql.NullTime) *string {
 	if !v.Valid {
 		return nil
 	}
-	value := v.Time.Format(time.RFC3339)
+	value := formatTime(v.Time)
 	return &value
 }
 

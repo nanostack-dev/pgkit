@@ -8,6 +8,7 @@ Start with [agent rules](../AGENTS.md) and [domain vocabulary](../CONTEXT.md). T
 - [Queue and worker API](../README.md#worker-runtime): typed handles, pickup modes and notifications.
 - [Interval scheduling](../pgcron/README.md): schedule ownership, transactions, cadence and failure limits.
 - [Workflows](../workflow/README.md): durable Go functions, every operation and option, changing workflows, and how the runtime works.
+- [Admin UI](technical/admin-ui.md): screens, JSON API, security invariants and frontend structure; source in [ui/embedded](../ui/embedded).
 
 ## Development and operations
 

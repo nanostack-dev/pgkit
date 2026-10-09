@@ -12,6 +12,10 @@ The database suites provision containers. Check `docker info` and whether the cu
 
 Go serves the embedded `adminui/dist` snapshot, rather than the frontend source or `ui/embedded/build`. Rebuild and copy assets using [setup](setup.md), rebuild/restart the Go process, and verify the changed view. Include both source and generated assets in the PR.
 
+## The admin dev server shows request errors
+
+`pnpm --dir ui/embedded dev` proxies `/api` to `PGKIT_ADMIN_API` (default `http://127.0.0.1:18083`). A 502 or "Network error" means nothing listens there: start the playground with `PGKIT_PLAYGROUND_ADDR=127.0.0.1:18083`, or point `PGKIT_ADMIN_API` at your server and `PGKIT_DASHBOARD_TOKEN` at its token. To work without a backend, open the page with `?data=demo`. Verify that the overview loads its counts.
+
 ## Scheduled callback repeats after failure
 
 A failed schedule transaction leaves its due time unchanged; another replica can retry immediately. Essential side effects should be transactional enqueue operations, and external calls must be idempotent. Inspect the [scheduling contract](../../pgcron/README.md#scheduling-contract) before changing cadence or retry behavior; verify the affected pgcron tests.

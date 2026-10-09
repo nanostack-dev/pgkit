@@ -8,7 +8,7 @@ pgkit is a Go module embedded in its consumers, rather than an independently dep
 | `queue` | Durable jobs, claim/ack/retry/fail/reap and worker runtime | Applications own names, compatible payloads and handler semantics. |
 | `pgcron` | Durable interval cadence across replicas | The application migrates the schema and owns callback side effects. |
 | `workflow` | Durable Go functions: runs, named checkpoints, signals, child runs | The `pgworkflow_*` tables own execution state; one queue job per run drives it. |
-| `adminui` | Embedded Svelte assets and authenticated monitoring/mutation API | The application chooses exposure, token and enabled mutations. |
+| `adminui` | Embedded React admin app and authenticated monitoring/mutation API | The application chooses exposure, token and enabled mutations. |
 | `fx` | Optional Uber Fx wiring for these primitives | Consumers may use the core packages without this wiring. |
 
 ## Execution and durability
@@ -23,4 +23,4 @@ Durability does not make arbitrary HTTP calls or other external effects exactly 
 
 ## Administration
 
-The dashboard requires token authentication, keeps mutation endpoints configurable, and must preserve its existing CSRF protections. Server errors return only their status text, never internal database errors or secrets. Workflow screens list runs, show each run's checkpoints, children, input and output, and (with mutations enabled) retry a failed run from its checkpoints or cancel an unfinished one. The shipped assets are embedded from [adminui/dist](../../adminui/dist); frontend source is in [ui/embedded](../../ui/embedded). Asset rebuilds must update that embedded output as described in [setup](../development/setup.md).
+The dashboard requires token authentication, keeps mutation endpoints configurable, and must preserve its CSRF protections (a custom request header or an exactly matching origin). Server errors return only their status text, never internal database errors or secrets. It shows queue health and jobs, workflow runs with their checkpoint timeline, run trees and signals, and advisory locks; with mutations enabled it enqueues, replays and deletes jobs and retries or cancels runs. Its aggregate read models query the pgkit tables directly. The [admin UI](admin-ui.md) owns its screens, API, invariants and limits. The shipped assets are embedded from [adminui/dist](../../adminui/dist); frontend source is in [ui/embedded](../../ui/embedded). Asset rebuilds must update that embedded output as described in [setup](../development/setup.md).

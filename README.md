@@ -18,7 +18,7 @@ go get github.com/nanostack-dev/pgkit
 - `pgcron`: durable interval schedules shared across replicas ([docs](pgcron/README.md))
 - `queue`: durable queue with claim/ack/retry/fail/reap
 - `workflow`: durable Go functions with typed, checkpointed steps, sleeps, signals and child runs, built on `queue` ([docs](workflow/README.md))
-- `adminui`: an embedded dashboard (SvelteKit + Skeleton) to monitor queues and workflows
+- `adminui`: an embedded admin panel (React) to monitor and operate queues, workflow runs and advisory locks
 - `fx`: Uber Fx modules for locks, queues, workflows, and the dashboard
 
 ## Worker runtime
@@ -141,7 +141,7 @@ one of its keys commits, and when the listener reconnects.
 
 ## Admin UI Dashboard
 
-The dashboard is fully embedded (SvelteKit static build + JSON API) and protected with Basic Auth.
+The admin panel is fully embedded (React static build + JSON API) and protected with Basic Auth. It covers queue health and jobs, workflow runs with their checkpoint timeline, run trees and advisory locks, works on phones, and supports light and dark themes. See [docs/technical/admin-ui.md](docs/technical/admin-ui.md).
 
 Required env var:
 

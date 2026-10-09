@@ -1,43 +1,90 @@
-import type { QueueJobStatus, WorkflowRunStatus, WorkflowStepStatus } from './types';
+import { Box, Hourglass, RadioTower, Workflow, type LucideIcon } from 'lucide-react';
+import type { JobStatus, RunStatus, StepKind, StepStatus } from '../api/types';
 
-export function queueStatusTone(status: QueueJobStatus): string {
-	switch (status) {
-		case 'done':
-			return 'preset-tonal-success';
-		case 'failed':
-			return 'preset-tonal-error';
-		case 'processing':
-			return 'preset-tonal-warning';
-		default:
-			return 'preset-tonal-primary';
-	}
-}
+export type Tone = 'ok' | 'bad' | 'warn' | 'run' | 'wait' | 'idle';
 
-type BadgeStatus = WorkflowRunStatus | WorkflowStepStatus;
+export type AnyStatus = JobStatus | RunStatus | StepStatus;
 
-const badgeClasses: Record<BadgeStatus, string> = {
-	succeeded: 'bg-success-50 text-success-700 ring-1 ring-success-500/20',
-	failed: 'bg-error-50 text-error-700 ring-1 ring-error-500/20',
-	running: 'bg-primary-50 text-primary-700 ring-1 ring-primary-500/20',
-	waiting: 'bg-secondary-50 text-secondary-700 ring-1 ring-secondary-500/20',
-	retrying: 'bg-warning-50 text-warning-700 ring-1 ring-warning-500/20',
-	timed_out: 'bg-warning-50 text-warning-700 ring-1 ring-warning-500/20',
-	pending: 'bg-surface-100 text-surface-700 ring-1 ring-surface-500/20',
-	cancelled: 'bg-surface-100 text-surface-500 ring-1 ring-surface-500/20'
+const tones: Record<AnyStatus, Tone> = {
+	pending: 'idle',
+	processing: 'run',
+	done: 'ok',
+	failed: 'bad',
+	running: 'run',
+	waiting: 'wait',
+	succeeded: 'ok',
+	cancelled: 'idle',
+	retrying: 'warn',
+	timed_out: 'bad',
 };
 
-export function statusBadgeClass(status: BadgeStatus): string {
-	return badgeClasses[status] ?? badgeClasses.pending;
+const labels: Record<AnyStatus, string> = {
+	pending: 'Pending',
+	processing: 'Processing',
+	done: 'Done',
+	failed: 'Failed',
+	running: 'Running',
+	waiting: 'Waiting',
+	succeeded: 'Succeeded',
+	cancelled: 'Cancelled',
+	retrying: 'Retrying',
+	timed_out: 'Timed out',
+};
+
+export function statusTone(status: AnyStatus): Tone {
+	return tones[status] ?? 'idle';
 }
 
-export function isFinished(status: WorkflowRunStatus): boolean {
+export function statusLabel(status: AnyStatus): string {
+	return labels[status] ?? status;
+}
+
+export function isActive(status: AnyStatus): boolean {
+	return status === 'running' || status === 'processing' || status === 'retrying';
+}
+
+export const toneText: Record<Tone, string> = {
+	ok: 'text-ok',
+	bad: 'text-bad',
+	warn: 'text-warn',
+	run: 'text-run',
+	wait: 'text-wait',
+	idle: 'text-muted',
+};
+
+export const toneSoft: Record<Tone, string> = {
+	ok: 'bg-ok-soft text-ok',
+	bad: 'bg-bad-soft text-bad',
+	warn: 'bg-warn-soft text-warn',
+	run: 'bg-run-soft text-run',
+	wait: 'bg-wait-soft text-wait',
+	idle: 'bg-idle-soft text-muted',
+};
+
+export const toneDot: Record<Tone, string> = {
+	ok: 'bg-ok',
+	bad: 'bg-bad',
+	warn: 'bg-warn',
+	run: 'bg-run',
+	wait: 'bg-wait',
+	idle: 'bg-idle',
+};
+
+export function runFinished(status: RunStatus): boolean {
 	return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
-export function isRetryable(status: WorkflowRunStatus): boolean {
+export function runRetryable(status: RunStatus): boolean {
 	return status === 'failed' || status === 'cancelled';
 }
 
-export function statusLabel(status: BadgeStatus): string {
-	return status.replace('_', ' ');
+export function jobReplayable(status: JobStatus): boolean {
+	return status === 'done' || status === 'failed';
 }
+
+export const kindMeta: Record<StepKind, { label: string; icon: LucideIcon }> = {
+	step: { label: 'Step', icon: Box },
+	sleep: { label: 'Sleep', icon: Hourglass },
+	signal: { label: 'Signal', icon: RadioTower },
+	child: { label: 'Child run', icon: Workflow },
+};
