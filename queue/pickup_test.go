@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/nanostack-dev/pgkit/internal/testdb"
 )
 
 // noRescan keeps OnEnqueue workers from finding jobs by scanning, so every claim in
@@ -402,7 +403,10 @@ func (foreignConnector) Driver() driver.Driver { return foreignDriver{} }
 func openForeignDriverDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	ctx := context.Background()
-	pg, connString := startWorkerPostgres(t, ctx)
+	pg, connString, err := testdb.Start(ctx, "pgkit_worker_test")
+	if err != nil {
+		t.Fatalf("start postgres: %v", err)
+	}
 	t.Cleanup(func() { _ = pg.Terminate(ctx) })
 	config, err := pgx.ParseConfig(connString)
 	if err != nil {
@@ -410,7 +414,9 @@ func openForeignDriverDB(t *testing.T) (*sql.DB, string) {
 	}
 	db := sql.OpenDB(foreignConnector{stdlib.GetConnector(*config)})
 	t.Cleanup(func() { _ = db.Close() })
-	if err := waitWorkerPing(ctx, db, 20*time.Second); err != nil {
+	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
 	return db, connString
