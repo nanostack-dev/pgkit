@@ -7,7 +7,7 @@
 | Route | Purpose |
 | --- | --- |
 | `/` | Health: due/processing/failed/done jobs, run counts by status, throughput for the last hour or 24 hours, runs waiting and what they wait for, recent failures and activity. |
-| `/queues` | Per-queue breakdown, job explorer (`queue`, `status`, `search`, `offset` query parameters) and a job sheet opened with `?job=<id>`: payload, attempts, error, linked workflow run, replay and delete. Enqueue lives here. |
+| `/queues` | Per-queue breakdown, job explorer (`queue`, `status`, `search`, `offset` query parameters) and a job sheet opened with `?job=<id>`: payload, attempts and claims, error, linked workflow run, replay and delete. Enqueue lives here. |
 | `/workflows` | Per-workflow breakdown and run explorer. Child runs are hidden unless `children=1`. |
 | `/workflows/{id}` | Run detail: status, retry or cancel, ancestors, checkpoint timeline (kind, status, attempts, durations, wake and timeout countdowns, signal waits, child runs, errors, output), input, output, run tree and delivered signals. Refreshes while the run or one of its children is unfinished. |
 | `/locks` | PostgreSQL advisory locks in the current database with the holding or waiting session. |
@@ -24,7 +24,7 @@ All routes are under `/api/dashboard/` and require the token. The response types
 | `GET overview?range=1h\|24h` | Queue summary, due jobs, throughput buckets, recent and failed jobs; workflow counts, throughput, waiting, failed and recent runs (`workflow` is null without a workflow client). |
 | `GET queue/queues` | Per-queue counts, due jobs, oldest due time, last activity. |
 | `GET queue/jobs?queue=&status=&search=&limit=&offset=` | A page of jobs with payload previews. |
-| `GET queue/jobs/{id}` | One job with its payload (at most 1 MiB, `payload_encoding` json/text/base64, `payload_truncated`) and the workflow `run_id` for `pgworkflow:` jobs. |
+| `GET queue/jobs/{id}` | One job (jobs carry `attempts`, `max_attempts` and `claims`, every claim including snoozes and replays) with its payload (at most 1 MiB, `payload_encoding` json/text/base64, `payload_truncated`) and the workflow `run_id` for `pgworkflow:` jobs. |
 | `GET workflow/workflows` | Per-workflow versions and counts by status. |
 | `GET workflow/runs?workflow=&status=&parent_run_id=&top_level=true&search=&limit=&offset=` | Run summaries without input/output, with `child_count`, `step_count` and `current_step` (the latest checkpoint that has not succeeded). |
 | `GET workflow/runs/{id}` | The run with input/output, its queue `job_id`, checkpoints, up to 100 child summaries and `child_total`, root-first `ancestors` and the 50 newest signals. |

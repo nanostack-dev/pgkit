@@ -130,7 +130,7 @@ func (row jobRow) detail() queueJobDetail {
 }
 
 const queueJobSelect = `
-SELECT id, queue_name, status, attempts, max_attempts, available_at, claimed_by, claimed_at, done_at, last_error,
+SELECT id, queue_name, status, attempts, max_attempts, claims, available_at, claimed_by, claimed_at, done_at, last_error,
        substring(payload FROM 1 FOR $1), octet_length(payload), created_at, updated_at
 FROM pgqueue_jobs`
 
@@ -141,7 +141,7 @@ type rowScanner interface {
 func scanJobRow(row rowScanner) (jobRow, error) {
 	var result jobRow
 	job := &result.job
-	err := row.Scan(&job.ID, &job.QueueName, &job.Status, &job.Attempts, &job.MaxAttempts, &job.AvailableAt,
+	err := row.Scan(&job.ID, &job.QueueName, &job.Status, &job.Attempts, &job.MaxAttempts, &job.Claims, &job.AvailableAt,
 		&job.ClaimedBy, &job.ClaimedAt, &job.DoneAt, &job.LastError, &result.head, &result.size, &job.CreatedAt, &job.UpdatedAt)
 	if err != nil {
 		return jobRow{}, err

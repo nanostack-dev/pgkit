@@ -47,6 +47,7 @@ function job(id: number, queue: string, status: JobStatus, extra: Partial<QueueJ
 		status,
 		attempts: status === 'pending' ? 0 : status === 'failed' ? 5 : 1,
 		max_attempts: 5,
+		claims: status === 'pending' ? 0 : status === 'failed' ? 5 : 1,
 		available_at: at(-id * minute),
 		claimed_by: status === 'processing' ? 'worker-1' : null,
 		claimed_at: status === 'processing' ? at(-20_000) : null,
@@ -309,6 +310,7 @@ export function worstDataset(): Dataset {
 		job(9_223_372_036, longQueue, 'failed', {
 			attempts: 25,
 			max_attempts: 25,
+			claims: 31,
 			last_error: panic,
 			claimed_by: 'worker-7f9c2b1e-4d3a-4e8f-9a6b-2c1d0e9f8a7b@ip-10-0-143-27.eu-west-1.compute.internal',
 			payload: bigPayload.slice(0, 1_048_576),
@@ -516,6 +518,7 @@ export function asJob(detail: QueueJobDetail): QueueJob {
 		status: detail.status,
 		attempts: detail.attempts,
 		max_attempts: detail.max_attempts,
+		claims: detail.claims,
 		available_at: detail.available_at,
 		claimed_by: detail.claimed_by,
 		claimed_at: detail.claimed_at,

@@ -1,6 +1,6 @@
 # 0002: React admin UI
 
-Status: accepted (2026-10-08), introduced on `feat/admin-react`, stacked on `feat/workflow-v2`.
+Status: accepted (2026-10-08)
 
 ## Context
 

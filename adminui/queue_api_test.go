@@ -245,7 +245,7 @@ func TestQueueJobDetail(t *testing.T) {
 			t.Fatalf("payload = %q encoding=%s bytes=%d truncated=%v run_id=%v", job.Payload, job.PayloadEncoding, job.PayloadBytes, job.PayloadTruncated, job.RunID)
 		}
 		raw := getMap(t, detailURL(id), http.StatusOK)
-		requireKeys(t, "job detail", raw, "id", "queue_name", "status", "attempts", "max_attempts", "available_at", "claimed_by", "claimed_at", "done_at", "last_error", "payload_preview", "created_at", "updated_at", "payload", "payload_encoding", "payload_bytes", "payload_truncated", "run_id")
+		requireKeys(t, "job detail", raw, "id", "queue_name", "status", "attempts", "max_attempts", "claims", "available_at", "claimed_by", "claimed_at", "done_at", "last_error", "payload_preview", "created_at", "updated_at", "payload", "payload_encoding", "payload_bytes", "payload_truncated", "run_id")
 		if value, present := raw["run_id"]; !present || value != nil {
 			t.Fatalf("run_id = %v (present=%v), want explicit null", value, present)
 		}
@@ -296,6 +296,24 @@ func TestQueueJobDetail(t *testing.T) {
 		}
 		if !bytes.HasPrefix(payload, []byte(job.Payload)) {
 			t.Fatal("shown payload is not a prefix of the stored payload")
+		}
+	})
+
+	t.Run("claimed job reports its claims", func(t *testing.T) {
+		id := enqueueJob(t, ctx, queue, "detail.claimed", []byte(`{"claim":true}`), nil)
+		claimed, found, err := queue.Claim(ctx, "detail.claimed", "worker-a")
+		if err != nil || !found || claimed.ID != id {
+			t.Fatalf("claim = %+v found=%v err=%v", claimed, found, err)
+		}
+		var job queueJobDetail
+		getJSON(t, detailURL(id), http.StatusOK, &job)
+		if job.Status != "processing" || job.Claims != 1 || job.Attempts != 1 || job.ClaimedBy == nil || *job.ClaimedBy != "worker-a" {
+			t.Fatalf("job = %+v", job.queueJob)
+		}
+		var page listResponse[queueJob]
+		getJSON(t, server.URL+"/api/dashboard/queue/jobs?queue=detail.claimed", http.StatusOK, &page)
+		if len(page.Items) != 1 || page.Items[0].Claims != 1 {
+			t.Fatalf("listed = %+v", page.Items)
 		}
 	})
 

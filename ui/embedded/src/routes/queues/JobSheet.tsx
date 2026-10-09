@@ -17,7 +17,7 @@ import { EmptyState, ErrorState, Skeleton } from '../../components/States';
 import { Countdown, RelativeTime } from '../../components/Time';
 import { useNow } from '../../lib/clock';
 import { cn } from '../../lib/cn';
-import { formatDateTime, formatNumber, isParked, parseTime, shortId, jobLabel } from '../../lib/format';
+import { formatDateTime, formatNumber, isParked, jobLabel, parseTime, shortId } from '../../lib/format';
 import { jobReplayable } from '../../lib/status';
 
 function Attempts({ used, max }: { used: number; max: number }) {
@@ -57,6 +57,11 @@ function JobDetail({ job }: { job: QueueJobDetail }) {
 			<dl className="grid grid-cols-2 gap-x-4 gap-y-3.5">
 				<Fact label="Attempts">
 					<Attempts used={job.attempts} max={job.max_attempts} />
+				</Fact>
+				<Fact label="Claims">
+					<span className="tabular" title="Every time a worker claimed this job, replays and snoozes included">
+						{formatNumber(job.claims)}
+					</span>
 				</Fact>
 				<Fact label="Created">
 					<RelativeTime value={job.created_at} />

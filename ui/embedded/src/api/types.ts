@@ -25,6 +25,7 @@ export type QueueJob = {
 	status: JobStatus;
 	attempts: number;
 	max_attempts: number;
+	claims: number;
 	available_at: string;
 	claimed_by: string | null;
 	claimed_at: string | null;

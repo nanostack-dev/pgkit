@@ -71,6 +71,7 @@ type queueJob struct {
 	Status         string  `json:"status"`
 	Attempts       int     `json:"attempts"`
 	MaxAttempts    int     `json:"max_attempts"`
+	Claims         int     `json:"claims"`
 	AvailableAt    string  `json:"available_at"`
 	ClaimedBy      *string `json:"claimed_by"`
 	ClaimedAt      *string `json:"claimed_at"`
@@ -495,6 +496,7 @@ func newQueueJob(job qpkg.Job, payloadPreview string) queueJob {
 		Status:         string(job.Status),
 		Attempts:       job.Attempts,
 		MaxAttempts:    job.MaxAttempts,
+		Claims:         job.Claims,
 		AvailableAt:    formatTime(job.AvailableAt),
 		ClaimedBy:      nullString(job.ClaimedBy),
 		ClaimedAt:      nullTime(job.ClaimedAt),
