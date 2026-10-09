@@ -36,6 +36,8 @@ var (
 // is absent: a missing *relation* is schema drift, a real fault that must keep
 // logging at error, whereas invalid_catalog_name (3D000) means the whole database
 // is gone — a torn-down preview environment, not a bug.
+const settleTimeout = 30 * time.Second
+
 const (
 	sqlStateInvalidCatalogName     = "3D000" // database does not exist (torn down)
 	sqlStateConnectionDoesNotExist = "08003"
@@ -420,8 +422,8 @@ func (w *Worker) scan(ctx context.Context) scanResult {
 		}
 
 		claimed := 0
-		for ; claimed < w.cfg.BatchSizePerQueue; claimed++ {
-			job, found, err := w.client.Claim(ctx, queueName, w.cfg.WorkerID)
+		for ; claimed < w.cfg.BatchSizePerQueue && ctx.Err() == nil; claimed++ {
+			job, found, err := w.claim(ctx, queueName)
 			if err != nil {
 				w.client.logFailure(ctx, "queue claim failed", map[string]any{"queue": queueName, "error": err.Error()}, err)
 				result.claimFailed = true
@@ -430,37 +432,12 @@ func (w *Worker) scan(ctx context.Context) scanResult {
 			if !found || job == nil {
 				break
 			}
-
-			if err := h(ctx, *job); err != nil {
-				if IsHandled(err) {
-					continue
-				}
-				if IsNonRetryable(err) {
-					if failErr := w.client.Fail(ctx, job.ID, err); failErr != nil {
-						w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
-					} else if w.cfg.OnJobFailed != nil {
-						job.Status = StatusFailed
-						job.LastError = sql.NullString{String: err.Error(), Valid: true}
-						w.cfg.OnJobFailed(ctx, *job)
-					}
-					continue
-				}
-
-				delay := w.cfg.RetryDelay(*job, err)
-				if retryErr := w.client.Retry(ctx, job.ID, delay, err); retryErr != nil {
-					w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
-				} else if job.Attempts >= job.MaxAttempts && w.cfg.OnJobFailed != nil {
-					// Retry's zombie-prevention moved it to failed.
-					job.Status = StatusFailed
-					job.LastError = sql.NullString{String: err.Error(), Valid: true}
-					w.cfg.OnJobFailed(ctx, *job)
-				}
-				continue
+			if ctx.Err() != nil {
+				w.handBack(ctx, job)
+				break
 			}
 
-			if ackErr := w.client.Ack(ctx, job.ID); ackErr != nil {
-				w.client.logError(ctx, "queue ack failed", map[string]any{"id": job.ID, "error": ackErr.Error()})
-			}
+			w.settle(ctx, job, h(ctx, *job))
 		}
 		if claimed == w.cfg.BatchSizePerQueue {
 			result.batchFilled = true
@@ -469,8 +446,75 @@ func (w *Worker) scan(ctx context.Context) scanResult {
 	return result
 }
 
+// claim runs the claim transaction on a context that shutdown does not cancel:
+// cancelling a commit in flight could leave a job claimed that the worker believes
+// it never got.
+func (w *Worker) claim(workerCtx context.Context, queueName string) (*Job, bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
+	defer cancel()
+	return w.client.Claim(ctx, queueName, w.cfg.WorkerID)
+}
+
+// handBack returns a job claimed as the worker began stopping, due now and without
+// counting the attempt, so another worker takes it without waiting for the reaper.
+func (w *Worker) handBack(workerCtx context.Context, job *Job) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
+	defer cancel()
+	tx, err := w.client.db.BeginTx(ctx, nil)
+	if err != nil {
+		w.client.logError(ctx, "queue hand back failed", map[string]any{"id": job.ID, "error": err.Error()})
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := w.client.SnoozeTx(ctx, tx, *job, time.Unix(0, 0)); err != nil {
+		w.client.logError(ctx, "queue hand back failed", map[string]any{"id": job.ID, "error": err.Error()})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		w.client.logError(ctx, "queue hand back failed", map[string]any{"id": job.ID, "error": err.Error()})
+	}
+}
+
+// settle records the handler's outcome for job. It uses a context that shutdown
+// does not cancel, so a handler finishing while the worker stops still settles its
+// job instead of leaving it processing until the reaper takes it back.
+func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
+	defer cancel()
+	switch {
+	case handlerErr == nil:
+		if ackErr := w.client.Ack(ctx, job.ID); ackErr != nil {
+			w.client.logError(ctx, "queue ack failed", map[string]any{"id": job.ID, "error": ackErr.Error()})
+		}
+	case IsHandled(handlerErr):
+	case IsNonRetryable(handlerErr):
+		if failErr := w.client.Fail(ctx, job.ID, handlerErr); failErr != nil {
+			w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
+		} else if w.cfg.OnJobFailed != nil {
+			job.Status = StatusFailed
+			job.LastError = sql.NullString{String: handlerErr.Error(), Valid: true}
+			w.cfg.OnJobFailed(ctx, *job)
+		}
+	default:
+		delay := w.cfg.RetryDelay(*job, handlerErr)
+		if retryErr := w.client.Retry(ctx, job.ID, delay, handlerErr); retryErr != nil {
+			w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
+		} else if job.Attempts >= job.MaxAttempts && w.cfg.OnJobFailed != nil {
+			job.Status = StatusFailed
+			job.LastError = sql.NullString{String: handlerErr.Error(), Valid: true}
+			w.cfg.OnJobFailed(ctx, *job)
+		}
+	}
+}
+
+// reap requeues stuck jobs of the worker's own queues only: its visibility timeout
+// says nothing about how long other queues' jobs may take.
 func (w *Worker) reap(ctx context.Context) error {
-	result, err := w.client.ReapStuckJobs(ctx, w.cfg.VisibilityTimeout)
+	queueNames := w.registry.queueNames()
+	if len(queueNames) == 0 {
+		return nil
+	}
+	result, err := w.client.Reap(ctx, ReapParams{VisibilityTimeout: w.cfg.VisibilityTimeout, QueueNames: queueNames})
 	if err != nil {
 		return err
 	}

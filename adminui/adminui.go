@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -33,7 +34,7 @@ var ErrMissingToken = errors.New("pgkit adminui: missing dashboard token")
 
 type UI struct {
 	queue           *qpkg.Client
-	workflow        *workflow.Module
+	workflow        *workflow.Client
 	token           string
 	enableMutations bool
 	listLimit       int
@@ -47,7 +48,7 @@ type Options struct {
 	EnableMutations *bool
 	EnableAPIEnv    string
 	Limit           int
-	Workflow        *workflow.Module
+	Workflow        *workflow.Client
 	Assets          fs.FS
 }
 
@@ -78,69 +79,43 @@ type queueJob struct {
 }
 
 type workflowRun struct {
-	ID                   string  `json:"id"`
-	WorkflowDefinitionID int64   `json:"workflow_definition_id"`
-	WorkflowName         string  `json:"workflow_name"`
-	WorkflowVersion      int     `json:"workflow_version"`
-	Status               string  `json:"status"`
-	StartedAt            string  `json:"started_at"`
-	CompletedAt          *string `json:"completed_at"`
-	CreatedBy            *string `json:"created_by"`
-	CorrelationKey       *string `json:"correlation_key"`
-	CreatedAt            string  `json:"created_at"`
-	UpdatedAt            string  `json:"updated_at"`
-	InputJSON            string  `json:"input_json"`
-	ContextJSON          string  `json:"context_json"`
-}
-
-type workflowDefinition struct {
-	ID           int64   `json:"id"`
-	WorkflowName string  `json:"workflow_name"`
-	Version      int     `json:"version"`
-	Status       string  `json:"status"`
-	Title        string  `json:"title"`
-	Description  *string `json:"description"`
-	ContentHash  string  `json:"content_hash"`
-	CreatedAt    string  `json:"created_at"`
-	ActivatedAt  *string `json:"activated_at"`
+	ID          string  `json:"id"`
+	Workflow    string  `json:"workflow"`
+	Version     int     `json:"version"`
+	Key         *string `json:"key"`
+	Status      string  `json:"status"`
+	Error       *string `json:"error"`
+	TimedOut    bool    `json:"timed_out"`
+	ParentRunID *string `json:"parent_run_id"`
+	Input       string  `json:"input"`
+	Output      *string `json:"output"`
+	WakeAt      *string `json:"wake_at"`
+	DeadlineAt  *string `json:"deadline_at"`
+	CreatedAt   string  `json:"created_at"`
+	StartedAt   *string `json:"started_at"`
+	CompletedAt *string `json:"completed_at"`
+	UpdatedAt   string  `json:"updated_at"`
 }
 
 type workflowStep struct {
-	ID             int64    `json:"id"`
-	RunID          string   `json:"run_id"`
-	StepName       string   `json:"step_name"`
-	ItemKey        string   `json:"item_key"`
-	StepKind       string   `json:"step_kind"`
-	Status         string   `json:"status"`
-	Attempt        int      `json:"attempt"`
-	MaxAttempts    int      `json:"max_attempts"`
-	QueueJobID     *int64   `json:"queue_job_id"`
-	AvailableAt    *string  `json:"available_at"`
-	StartedAt      *string  `json:"started_at"`
-	CompletedAt    *string  `json:"completed_at"`
-	DependencyJSON []string `json:"dependency_json"`
-	InputJSON      string   `json:"input_json"`
-	OutputJSON     string   `json:"output_json"`
-	ErrorJSON      string   `json:"error_json"`
-	CreatedAt      string   `json:"created_at"`
-	UpdatedAt      string   `json:"updated_at"`
+	Name        string  `json:"name"`
+	Kind        string  `json:"kind"`
+	Status      string  `json:"status"`
+	Attempts    int     `json:"attempts"`
+	Output      *string `json:"output"`
+	Error       *string `json:"error"`
+	WakeAt      *string `json:"wake_at"`
+	ChildRunID  *string `json:"child_run_id"`
+	Signal      *string `json:"signal"`
+	CreatedAt   string  `json:"created_at"`
+	CompletedAt *string `json:"completed_at"`
+	UpdatedAt   string  `json:"updated_at"`
 }
 
-type workflowRunGraphNode struct {
-	Node       workflow.GraphNode              `json:"node"`
-	Status     string                          `json:"status"`
-	Step       *workflowStep                   `json:"step,omitempty"`
-	Items      []workflowStep                  `json:"items,omitempty"`
-	ItemCounts workflow.RunGraphNodeItemCounts `json:"item_counts"`
-}
-
-type workflowRunGraphView struct {
-	Run        workflowRun                  `json:"run"`
-	Definition workflowDefinition           `json:"definition"`
-	Graph      workflow.Graph               `json:"graph"`
-	Nodes      []workflowRunGraphNode       `json:"nodes"`
-	Edges      []workflow.GraphEdge         `json:"edges"`
-	Summary    workflow.RunGraphViewSummary `json:"summary"`
+type workflowRunDetail struct {
+	Run      workflowRun    `json:"run"`
+	Steps    []workflowStep `json:"steps"`
+	Children []workflowRun  `json:"children"`
 }
 
 type listResponse[T any] struct {
@@ -220,8 +195,8 @@ func New(queue *qpkg.Client, opts Options) (*UI, error) {
 	}, nil
 }
 
-func NewFromEnv(queue *qpkg.Client, workflowModule *workflow.Module) (*UI, error) {
-	return New(queue, Options{Workflow: workflowModule})
+func NewFromEnv(queue *qpkg.Client, workflows *workflow.Client) (*UI, error) {
+	return New(queue, Options{Workflow: workflows})
 }
 
 func (u *UI) Handler() http.Handler {
@@ -237,7 +212,7 @@ func (u *UI) Handler() http.Handler {
 		mux.HandleFunc("POST /api/dashboard/queue/jobs/{id}/replay", u.requireToken(u.requireCSRF(u.handleReplayJob)))
 		mux.HandleFunc("DELETE /api/dashboard/queue/jobs/{id}", u.requireToken(u.requireCSRF(u.handleDeleteJob)))
 		mux.HandleFunc("POST /api/dashboard/workflow/runs/{id}/retry", u.requireToken(u.requireCSRF(u.handleRetryWorkflowRun)))
-		mux.HandleFunc("POST /api/dashboard/workflow/steps/{id}/retry", u.requireToken(u.requireCSRF(u.handleRetryWorkflowStep)))
+		mux.HandleFunc("POST /api/dashboard/workflow/runs/{id}/cancel", u.requireToken(u.requireCSRF(u.handleCancelWorkflowRun)))
 	}
 	fileServer := http.FileServer(http.FS(u.assets))
 	mux.Handle("GET /_app/", u.requireToken(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -343,10 +318,11 @@ func (u *UI) handleWorkflowRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := workflow.ListRunsParams{
-		WorkflowName: strings.TrimSpace(r.URL.Query().Get("workflow_name")),
-		Search:       strings.TrimSpace(r.URL.Query().Get("search")),
-		Limit:        queryInt(r, "limit", u.listLimit),
-		Offset:       queryInt(r, "offset", 0),
+		Workflow:    strings.TrimSpace(r.URL.Query().Get("workflow")),
+		ParentRunID: strings.TrimSpace(r.URL.Query().Get("parent_run_id")),
+		Search:      strings.TrimSpace(r.URL.Query().Get("search")),
+		Limit:       queryInt(r, "limit", u.listLimit),
+		Offset:      queryInt(r, "offset", 0),
 	}
 	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		params.Status = workflow.RunStatus(status)
@@ -364,12 +340,12 @@ func (u *UI) handleWorkflowRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	view, err := u.workflow.GetRunGraphView(r.Context(), strings.TrimSpace(r.PathValue("id")))
+	detail, err := u.buildWorkflowRunDetail(r.Context(), strings.TrimSpace(r.PathValue("id")))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeWorkflowError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toWorkflowRunGraphView(*view))
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (u *UI) handleEnqueueJob(w http.ResponseWriter, r *http.Request) {
@@ -431,53 +407,40 @@ func (u *UI) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (u *UI) handleRetryWorkflowRun(w http.ResponseWriter, r *http.Request) {
-	if u.workflow == nil {
-		http.NotFound(w, r)
-		return
-	}
-
-	run, err := u.workflow.RetryRun(r.Context(), strings.TrimSpace(r.PathValue("id")))
-	if err != nil {
-		switch {
-		case errors.Is(err, workflow.ErrRunNotFound):
-			writeError(w, http.StatusNotFound, err)
-		case errors.Is(err, workflow.ErrRunNotRetryable):
-			writeError(w, http.StatusConflict, err)
-		default:
-			writeError(w, http.StatusInternalServerError, err)
-		}
-		return
-	}
-
-	writeJSON(w, http.StatusOK, toWorkflowRun(*run))
+	u.mutateWorkflowRun(w, r, u.workflow.Retry)
 }
 
-func (u *UI) handleRetryWorkflowStep(w http.ResponseWriter, r *http.Request) {
+func (u *UI) handleCancelWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	u.mutateWorkflowRun(w, r, u.workflow.Cancel)
+}
+
+func (u *UI) mutateWorkflowRun(w http.ResponseWriter, r *http.Request, mutate func(context.Context, string) error) {
 	if u.workflow == nil {
 		http.NotFound(w, r)
 		return
 	}
-
-	id, ok := parsePathID(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid step id"))
+	runID := strings.TrimSpace(r.PathValue("id"))
+	if err := mutate(r.Context(), runID); err != nil {
+		writeWorkflowError(w, err)
 		return
 	}
-
-	step, err := u.workflow.RetryStep(r.Context(), id)
+	run, err := u.workflow.GetRun(r.Context(), runID)
 	if err != nil {
-		switch {
-		case errors.Is(err, workflow.ErrStepNotFound):
-			writeError(w, http.StatusNotFound, err)
-		case errors.Is(err, workflow.ErrStepNotRetryable):
-			writeError(w, http.StatusConflict, err)
-		default:
-			writeError(w, http.StatusInternalServerError, err)
-		}
+		writeWorkflowError(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, toWorkflowRun(run))
+}
 
-	writeJSON(w, http.StatusOK, toWorkflowStep(*step))
+func writeWorkflowError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, workflow.ErrRunNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, workflow.ErrRunNotRetryable), errors.Is(err, workflow.ErrRunFinished):
+		writeError(w, http.StatusConflict, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func (u *UI) handleSPA(w http.ResponseWriter, _ *http.Request) {
@@ -548,6 +511,29 @@ func (u *UI) buildQueueJobs(ctx context.Context, params qpkg.ListJobsParams) (li
 	return listResponse[queueJob]{Items: items, Total: total, Limit: params.Limit, Offset: params.Offset}, nil
 }
 
+func (u *UI) buildWorkflowRunDetail(ctx context.Context, runID string) (workflowRunDetail, error) {
+	run, err := u.workflow.GetRun(ctx, runID)
+	if err != nil {
+		return workflowRunDetail{}, err
+	}
+	steps, err := u.workflow.ListSteps(ctx, runID)
+	if err != nil {
+		return workflowRunDetail{}, err
+	}
+	children, err := u.workflow.ListRuns(ctx, workflow.ListRunsParams{ParentRunID: runID, Limit: maxListLimit})
+	if err != nil {
+		return workflowRunDetail{}, err
+	}
+	detail := workflowRunDetail{Run: toWorkflowRun(run), Steps: make([]workflowStep, 0, len(steps)), Children: make([]workflowRun, 0, len(children))}
+	for _, step := range steps {
+		detail.Steps = append(detail.Steps, toWorkflowStep(step))
+	}
+	for _, child := range children {
+		detail.Children = append(detail.Children, toWorkflowRun(child))
+	}
+	return detail, nil
+}
+
 func (u *UI) buildWorkflowRuns(ctx context.Context, params workflow.ListRunsParams) (listResponse[workflowRun], error) {
 	runs, err := u.workflow.ListRuns(ctx, params)
 	if err != nil {
@@ -582,92 +568,57 @@ func toQueueJob(job qpkg.Job) queueJob {
 	}
 }
 
-func toWorkflowRun(run workflow.RunRecord) workflowRun {
+func toWorkflowRun(run workflow.RunInfo) workflowRun {
 	return workflowRun{
-		ID:                   run.ID,
-		WorkflowDefinitionID: run.WorkflowDefinitionID,
-		WorkflowName:         run.WorkflowName,
-		WorkflowVersion:      run.WorkflowVersion,
-		Status:               string(run.Status),
-		StartedAt:            run.StartedAt.Format(time.RFC3339),
-		CompletedAt:          nullTime(run.CompletedAt),
-		CreatedBy:            nullString(run.CreatedBy),
-		CorrelationKey:       nullString(run.CorrelationKey),
-		CreatedAt:            run.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:            run.UpdatedAt.Format(time.RFC3339),
-		InputJSON:            string(run.InputJSON),
-		ContextJSON:          string(run.ContextJSON),
+		ID:          run.ID,
+		Workflow:    run.Workflow,
+		Version:     run.Version,
+		Key:         optionalString(run.Key),
+		Status:      string(run.Status),
+		Error:       optionalString(run.Error),
+		TimedOut:    run.TimedOut,
+		ParentRunID: optionalString(run.ParentRunID),
+		Input:       string(run.Input),
+		Output:      optionalString(string(run.Output)),
+		WakeAt:      optionalTime(run.WakeAt),
+		DeadlineAt:  optionalTime(run.DeadlineAt),
+		CreatedAt:   run.CreatedAt.Format(time.RFC3339),
+		StartedAt:   optionalTime(run.StartedAt),
+		CompletedAt: optionalTime(run.CompletedAt),
+		UpdatedAt:   run.UpdatedAt.Format(time.RFC3339),
 	}
 }
 
-func toWorkflowDefinition(def workflow.DefinitionRecord) workflowDefinition {
-	return workflowDefinition{
-		ID:           def.ID,
-		WorkflowName: def.WorkflowName,
-		Version:      def.Version,
-		Status:       string(def.Status),
-		Title:        def.Title,
-		Description:  nullString(def.Description),
-		ContentHash:  def.ContentHash,
-		CreatedAt:    def.CreatedAt.Format(time.RFC3339),
-		ActivatedAt:  nullTime(def.ActivatedAt),
-	}
-}
-
-func toWorkflowStep(step workflow.StepRecord) workflowStep {
+func toWorkflowStep(step workflow.StepInfo) workflowStep {
 	return workflowStep{
-		ID:             step.ID,
-		RunID:          step.RunID,
-		StepName:       step.StepName,
-		ItemKey:        step.ItemKey,
-		StepKind:       string(step.StepKind),
-		Status:         string(step.Status),
-		Attempt:        step.Attempt,
-		MaxAttempts:    step.MaxAttempts,
-		QueueJobID:     nullInt64(step.QueueJobID),
-		AvailableAt:    nullTime(step.AvailableAt),
-		StartedAt:      nullTime(step.StartedAt),
-		CompletedAt:    nullTime(step.CompletedAt),
-		DependencyJSON: append([]string(nil), step.DependencyJSON...),
-		InputJSON:      jsonBytes(step.InputJSON),
-		OutputJSON:     jsonBytes(step.OutputJSON),
-		ErrorJSON:      jsonBytes(step.ErrorJSON),
-		CreatedAt:      step.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:      step.UpdatedAt.Format(time.RFC3339),
+		Name:        step.Name,
+		Kind:        string(step.Kind),
+		Status:      string(step.Status),
+		Attempts:    step.Attempts,
+		Output:      optionalString(string(step.Output)),
+		Error:       optionalString(step.Error),
+		WakeAt:      optionalTime(step.WakeAt),
+		ChildRunID:  optionalString(step.ChildRunID),
+		Signal:      optionalString(step.Signal),
+		CreatedAt:   step.CreatedAt.Format(time.RFC3339),
+		CompletedAt: optionalTime(step.CompletedAt),
+		UpdatedAt:   step.UpdatedAt.Format(time.RFC3339),
 	}
 }
 
-func toWorkflowRunGraphView(view workflow.RunGraphView) workflowRunGraphView {
-	nodes := make([]workflowRunGraphNode, 0, len(view.Nodes))
-	for _, node := range view.Nodes {
-		items := make([]workflowStep, 0, len(node.Items))
-		for _, item := range node.Items {
-			items = append(items, toWorkflowStep(item))
-		}
-		nodes = append(nodes, workflowRunGraphNode{
-			Node:       node.Node,
-			Status:     string(node.Status),
-			Step:       toWorkflowStepPtr(node.Step),
-			Items:      items,
-			ItemCounts: node.ItemCounts,
-		})
-	}
-	return workflowRunGraphView{
-		Run:        toWorkflowRun(view.Run),
-		Definition: toWorkflowDefinition(view.Definition),
-		Graph:      view.Graph,
-		Nodes:      nodes,
-		Edges:      view.Edges,
-		Summary:    view.Summary,
-	}
-}
-
-func toWorkflowStepPtr(step *workflow.StepRecord) *workflowStep {
-	if step == nil {
+func optionalString(value string) *string {
+	if value == "" {
 		return nil
 	}
-	converted := toWorkflowStep(*step)
-	return &converted
+	return &value
+}
+
+func optionalTime(value time.Time) *string {
+	if value.IsZero() {
+		return nil
+	}
+	formatted := value.Format(time.RFC3339)
+	return &formatted
 }
 
 func (u *UI) requireToken(next http.HandlerFunc) http.HandlerFunc {
@@ -688,13 +639,24 @@ func (u *UI) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		origin := r.Header.Get("Origin")
-		if origin != "" && strings.Contains(origin, r.Host) {
+		if sameOrigin(r) {
 			next(w, r)
 			return
 		}
 		http.Error(w, "forbidden: missing CSRF token", http.StatusForbidden)
 	}
+}
+
+// sameOrigin reports whether the request's Origin header names this server's host
+// exactly; a host that merely contains it, like admin.example.com.evil.example,
+// does not count.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
 }
 
 func queryInt(r *http.Request, key string, fallback int) int {
@@ -744,27 +706,18 @@ func nullTime(v sql.NullTime) *string {
 	return &value
 }
 
-func nullInt64(v sql.NullInt64) *int64 {
-	if !v.Valid {
-		return nil
-	}
-	value := v.Int64
-	return &value
-}
-
-func jsonBytes(v []byte) string {
-	if len(v) == 0 {
-		return ""
-	}
-	return string(v)
-}
-
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeError reports err to the client, except for server errors, whose details
+// (database errors included) stay out of responses.
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"error": err.Error()})
+	message := err.Error()
+	if status >= http.StatusInternalServerError {
+		message = http.StatusText(status)
+	}
+	writeJSON(w, status, map[string]any{"error": message})
 }

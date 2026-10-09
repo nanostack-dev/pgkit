@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getWorkflowRuns, retryWorkflowRun } from '$lib/api';
+	import { cancelWorkflowRun, getWorkflowRuns, retryWorkflowRun } from '$lib/api';
 	import { formatDateTime } from '$lib/format';
-	import { workflowRunTone } from '$lib/status';
+	import { isFinished, isRetryable, statusBadgeClass } from '$lib/status';
 	import type { WorkflowRun } from '$lib/types';
 	import { 
 		WorkflowIcon, 
@@ -11,7 +11,7 @@
 		ChevronLeftIcon, 
 		ChevronRightIcon,
 		RefreshCwIcon,
-		CheckCircle2Icon,
+		CircleSlashIcon,
 		AlertTriangleIcon
 	} from 'lucide-svelte';
 
@@ -22,7 +22,7 @@
 	let total = $state(0);
 	let error = $state('');
 	let loading = $state(true);
-	let retryingRunID = $state<string | null>(null);
+	let busyRunID = $state<string | null>(null);
 	const limit = 20;
 	let offset = $state(0);
 
@@ -30,7 +30,7 @@
 		loading = true;
 		error = '';
 		try {
-			const response = await getWorkflowRuns({ workflow_name: workflowName, status, search, limit, offset });
+			const response = await getWorkflowRuns({ workflow: workflowName, status, search, limit, offset });
 			runs = response.items;
 			total = response.total;
 		} catch (err) {
@@ -51,16 +51,16 @@
 		void refresh();
 	}
 
-	async function retryRun(runID: string) {
-		retryingRunID = runID;
+	async function act(runID: string, action: (runID: string) => Promise<unknown>, failure: string) {
+		busyRunID = runID;
 		error = '';
 		try {
-			await retryWorkflowRun(runID);
+			await action(runID);
 			await refresh();
 		} catch (err) {
-			error = err instanceof Error ? err.message : 'Failed to retry workflow run.';
+			error = err instanceof Error ? err.message : failure;
 		} finally {
-			retryingRunID = null;
+			busyRunID = null;
 		}
 	}
 
@@ -78,7 +78,7 @@
 		</div>
 		Workflows
 	</h1>
-	<p class="mt-3 text-surface-500 max-w-2xl text-sm">Monitor version-pinned runs, DAG definitions, and live execution state.</p>
+	<p class="mt-3 text-surface-500 max-w-2xl text-sm">Monitor durable runs: their checkpointed steps, what they wait for, and why they failed.</p>
 </div>
 
 <div class="bg-white/70 backdrop-blur-xl border border-surface-200/60 rounded-3xl shadow-[0_4px_20px_-8px_rgba(0,0,0,0.05)] overflow-hidden flex flex-col">
@@ -91,7 +91,7 @@
 			<form class="flex flex-wrap items-center gap-3" onsubmit={applyFilters}>
 				<div class="relative min-w-[200px]">
 					<SearchIcon class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
-					<input class="w-full bg-white border border-surface-200 rounded-xl pl-9 pr-4 py-2 text-sm focus:ring-2 focus:ring-secondary-500/20 focus:border-secondary-500 transition-all outline-none" bind:value={search} placeholder="Search ID or correlation..." />
+					<input class="w-full bg-white border border-surface-200 rounded-xl pl-9 pr-4 py-2 text-sm focus:ring-2 focus:ring-secondary-500/20 focus:border-secondary-500 transition-all outline-none" bind:value={search} placeholder="Search run ID, key or workflow..." />
 				</div>
 				<div class="relative min-w-[160px]">
 					<FilterIcon class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
@@ -99,7 +99,9 @@
 				</div>
 				<select class="bg-white border border-surface-200 rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-secondary-500/20 focus:border-secondary-500 transition-all outline-none min-w-[140px] appearance-none" bind:value={status}>
 					<option value="">All statuses</option>
+					<option value="pending">Pending</option>
 					<option value="running">Running</option>
+					<option value="waiting">Waiting</option>
 					<option value="succeeded">Succeeded</option>
 					<option value="failed">Failed</option>
 					<option value="cancelled">Cancelled</option>
@@ -123,21 +125,20 @@
 					<th class="px-6 py-4 font-semibold">Run ID</th>
 					<th class="px-6 py-4 font-semibold">Workflow</th>
 					<th class="px-6 py-4 font-semibold">Status</th>
-					<th class="px-6 py-4 font-semibold">Started</th>
+					<th class="px-6 py-4 font-semibold">Created</th>
 					<th class="px-6 py-4 font-semibold">Completed</th>
-					<th class="px-6 py-4 font-semibold">Created By</th>
-					<th class="px-6 py-4 font-semibold">Correlation Key</th>
+					<th class="px-6 py-4 font-semibold">Key</th>
 					<th class="px-6 py-4 font-semibold text-right">Actions</th>
 				</tr>
 			</thead>
 			<tbody class="divide-y divide-surface-200/40 text-sm">
 				{#if loading && runs.length === 0}
-					<tr><td colspan="8" class="px-6 py-12 text-center text-surface-400">
+					<tr><td colspan="7" class="px-6 py-12 text-center text-surface-400">
 						<RefreshCwIcon class="size-6 animate-spin mx-auto mb-2 opacity-50" />
 						Loading workflow runs...
 					</td></tr>
 				{:else if runs.length === 0}
-					<tr><td colspan="8" class="px-6 py-16 text-center text-surface-500">
+					<tr><td colspan="7" class="px-6 py-16 text-center text-surface-500">
 						<div class="flex flex-col items-center justify-center gap-3">
 							<div class="bg-surface-100 p-3 rounded-full"><SearchIcon class="size-6 text-surface-400" /></div>
 							<p>No workflow runs match this filter set.</p>
@@ -152,40 +153,41 @@
 								</a>
 							</td>
 							<td class="px-6 py-4">
-								<div class="font-medium text-surface-900">{run.workflow_name}</div>
-								<div class="text-[0.65rem] text-surface-500 font-bold bg-surface-100 px-1.5 py-0.5 rounded w-fit mt-1">v{run.workflow_version}</div>
+								<div class="font-medium text-surface-900">{run.workflow}</div>
+								<div class="text-[0.65rem] text-surface-500 font-bold bg-surface-100 px-1.5 py-0.5 rounded w-fit mt-1">v{run.version}{run.parent_run_id ? ' · child' : ''}</div>
 							</td>
 							<td class="px-6 py-4">
-								<span class={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[0.65rem] font-bold uppercase tracking-wider ${
-									run.status === 'failed' ? 'bg-error-50 text-error-700 ring-1 ring-error-500/20' : 
-									run.status === 'succeeded' ? 'bg-success-50 text-success-700 ring-1 ring-success-500/20' : 
-									run.status === 'running' ? 'bg-primary-50 text-primary-700 ring-1 ring-primary-500/20' : 
-									'bg-surface-100 text-surface-700 ring-1 ring-surface-500/20'
-								}`}>
+								<span class={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[0.65rem] font-bold uppercase tracking-wider ${statusBadgeClass(run.status)}`}>
 									{run.status}
 								</span>
 							</td>
 							<td class="px-6 py-4 text-surface-700">
-								{formatDateTime(run.started_at)}
+								{formatDateTime(run.created_at)}
 							</td>
 							<td class="px-6 py-4 text-surface-500">
-								{formatDateTime(run.completed_at) || '-'}
-							</td>
-							<td class="px-6 py-4 text-surface-500">
-								{run.created_by ?? '-'}
+								{formatDateTime(run.completed_at)}
 							</td>
 							<td class="px-6 py-4">
-								<span class="font-mono text-xs text-surface-500">{run.correlation_key ?? '-'}</span>
+								<span class="font-mono text-xs text-surface-500">{run.key ?? '-'}</span>
 							</td>
 							<td class="px-6 py-4 text-right">
-								{#if run.status === 'failed' || run.status === 'cancelled'}
+								{#if isRetryable(run.status)}
 									<button
 										class="inline-flex items-center gap-1.5 rounded-lg border border-surface-200 bg-white px-3 py-1.5 text-xs font-medium text-surface-700 transition-colors hover:bg-surface-50 disabled:opacity-50"
-										onclick={() => retryRun(run.id)}
-										disabled={retryingRunID === run.id}
+										onclick={() => act(run.id, retryWorkflowRun, 'Failed to retry workflow run.')}
+										disabled={busyRunID === run.id}
 									>
-										<RefreshCwIcon class={`size-3.5 ${retryingRunID === run.id ? 'animate-spin' : ''}`} />
-										Retry Run
+										<RefreshCwIcon class={`size-3.5 ${busyRunID === run.id ? 'animate-spin' : ''}`} />
+										Retry
+									</button>
+								{:else if !isFinished(run.status)}
+									<button
+										class="inline-flex items-center gap-1.5 rounded-lg border border-surface-200 bg-white px-3 py-1.5 text-xs font-medium text-surface-700 transition-colors hover:bg-surface-50 disabled:opacity-50"
+										onclick={() => act(run.id, cancelWorkflowRun, 'Failed to cancel workflow run.')}
+										disabled={busyRunID === run.id}
+									>
+										<CircleSlashIcon class="size-3.5" />
+										Cancel
 									</button>
 								{:else}
 									<span class="text-surface-300">-</span>

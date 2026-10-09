@@ -54,11 +54,11 @@ func main() {
 		panic(fmt.Errorf("ensure queue schema: %w", err))
 	}
 
-	workflowModule, err := workflow.New(db, queue)
+	workflows, err := workflow.New(queue)
 	if err != nil {
-		panic(fmt.Errorf("new workflow module: %w", err))
+		panic(fmt.Errorf("new workflow client: %w", err))
 	}
-	if err := workflowModule.EnsureSchema(ctx); err != nil {
+	if err := workflows.EnsureSchema(ctx); err != nil {
 		panic(fmt.Errorf("ensure workflow schema: %w", err))
 	}
 
@@ -92,7 +92,7 @@ func main() {
 		}
 	}()
 
-	dashboard, err := adminui.NewFromEnv(queue, workflowModule)
+	dashboard, err := adminui.NewFromEnv(queue, workflows)
 	if err != nil {
 		panic(fmt.Errorf("create dashboard: %w (set PGKIT_DASHBOARD_TOKEN)", err))
 	}

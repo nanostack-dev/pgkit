@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { DashboardSnapshot } from '$lib/types';
 	import { formatCount, formatDateTime } from '$lib/format';
-	import { queueStatusTone, workflowRunTone } from '$lib/status';
+	import { queueStatusTone, statusBadgeClass } from '$lib/status';
 	import { 
 		Layers3Icon, 
 		LockIcon, 
@@ -146,7 +146,7 @@
 					<WorkflowIcon class="size-5 text-secondary-500" />
 					Recent Workflow Runs
 				</div>
-				<p class="text-sm text-surface-500 mt-1">Latest DAG executions</p>
+				<p class="text-sm text-surface-500 mt-1">Latest durable runs</p>
 			</div>
 			<a href="/workflows" class="flex items-center gap-1.5 text-sm font-medium text-secondary-600 hover:text-secondary-700 bg-secondary-50 hover:bg-secondary-100 px-3 py-1.5 rounded-lg transition-colors">
 				View All <ArrowRightIcon class="size-3.5" />
@@ -162,22 +162,17 @@
 							</div>
 							<div>
 								<div class="flex items-center gap-2">
-									<h4 class="font-medium text-surface-900">{run.workflow_name}</h4>
-									<span class="px-1.5 py-0.5 rounded text-[0.65rem] font-bold bg-surface-100 text-surface-600">v{run.workflow_version}</span>
+									<h4 class="font-medium text-surface-900">{run.workflow}</h4>
+									<span class="px-1.5 py-0.5 rounded text-[0.65rem] font-bold bg-surface-100 text-surface-600">v{run.version}</span>
 								</div>
 								<div class="flex items-center gap-3 mt-1.5">
 									<span class="font-mono text-[0.65rem] text-surface-400 bg-surface-100 px-1.5 py-0.5 rounded">{run.id.substring(0, 12)}...</span>
-									<span class="text-[0.7rem] text-surface-500 flex items-center gap-1"><ClockIcon class="size-3" /> {formatDateTime(run.started_at)}</span>
+									<span class="text-[0.7rem] text-surface-500 flex items-center gap-1"><ClockIcon class="size-3" /> {formatDateTime(run.created_at)}</span>
 								</div>
 							</div>
 						</div>
 						<div class="flex items-center gap-3">
-							<span class={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[0.65rem] font-bold uppercase tracking-wider ${
-								run.status === 'failed' ? 'bg-error-50 text-error-700 ring-1 ring-error-500/20' : 
-								run.status === 'succeeded' ? 'bg-success-50 text-success-700 ring-1 ring-success-500/20' : 
-								run.status === 'running' ? 'bg-primary-50 text-primary-700 ring-1 ring-primary-500/20' : 
-								'bg-surface-100 text-surface-700 ring-1 ring-surface-500/20'
-							}`}>
+							<span class={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[0.65rem] font-bold uppercase tracking-wider ${statusBadgeClass(run.status)}`}>
 								{run.status}
 							</span>
 							<ChevronRightIcon class="size-4 text-surface-300 group-hover:text-surface-600 transition-colors" />
