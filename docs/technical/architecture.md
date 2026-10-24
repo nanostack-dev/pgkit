@@ -13,7 +13,7 @@ pgkit is a Go module embedded in its consumers, rather than an independently dep
 
 ## Execution and durability
 
-Producers persist jobs, optionally within an application transaction. Workers claim available jobs using `FOR UPDATE SKIP LOCKED`; multiple replicas can share one queue. Successful handlers acknowledge jobs, retryable failures reschedule them, and exhausted or nonretryable failures become terminal. A reaper recovers expired processing claims.
+Producers persist jobs, optionally within an application transaction. Workers claim available jobs using `FOR UPDATE SKIP LOCKED`; multiple replicas can share one queue. Successful handlers acknowledge jobs, retryable failures reschedule them, and exhausted or nonretryable failures become terminal. A reaper recovers expired processing claims. A job stores the OpenTelemetry trace context of the span that enqueued it, and the worker runs each claim under a consumer span continuing that trace; see [tracing](../../README.md#tracing).
 
 Notification pickup uses `LISTEN/NOTIFY` as a wake-up hint and periodic rescans as recovery. Notifications are delivered at commit. A pgx stdlib connection can supply the listener configuration; other drivers need an explicit listener. See the [worker API](../../README.md#picking-up-jobs) and [pickup tests](../../queue/pickup_test.go).
 

@@ -193,6 +193,10 @@ lib/pq and other non-pgx drivers need `queueClient.ListenOn(dsn)` for that; with
 it the worker polls. `Run.Result` returns on a notification when available and
 polls otherwise.
 
+Each activation runs under the queue's consumer span (`pgkit.queue pgworkflow:<name>`),
+a child of the span that started the run, so steps and child runs join the
+starter's trace; see [tracing](../README.md#tracing).
+
 The `fx/workflow` module provides a `*workflow.Client` and can run a worker for the
 workflows provided in its `workflowfx.DefinitionsGroup`.
 

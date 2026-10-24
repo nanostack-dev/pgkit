@@ -138,11 +138,53 @@ or failed and replayed, and claimed elsewhere cannot touch the new claim. The cl
 number counts every claim and only grows; `attempts` stays the retry budget, which
 `SnoozeTx` refunds and a replay resets. Durations and timeouts keep sub-second
 precision; `Reap` refuses a non-positive visibility timeout. `EnsureSchema` adds
-the `claims` column to existing queues (schema version 2).
+the `claims` column to existing queues (schema version 2) and the `trace_context`
+column (schema version 3, see [Tracing](#tracing)).
 
 `client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
 `LISTEN` connection for other keys: a subscription wakes when a notification for
 one of its keys commits, and when the listener reconnects.
+
+### Tracing
+
+The queue propagates OpenTelemetry trace context through the job row, so a job
+enqueued while handling a request runs in that request's distributed trace. pgkit
+uses only the OpenTelemetry API and the global `otel.GetTracerProvider()` and
+`otel.GetTextMapPropagator()`; the application installs the SDK and exporter.
+
+```go
+otel.SetTracerProvider(sdkProvider)
+otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+```
+
+- **Enqueue:** when `ctx` carries a valid span context, `Enqueue`/`EnqueueTx` inject
+  it with the global propagator (W3C `traceparent`/`tracestate`, plus anything else
+  the propagator writes) and store the carrier in the nullable `trace_context JSONB`
+  column. Without a span or a propagator the column stays `NULL`.
+- **Execute:** each claim the worker runs is a `SpanKindConsumer` span named
+  `pgkit.queue <queue name>`, a child of the stored context (a new root when it is
+  `NULL`). The handler's `ctx` carries it, so database calls, HTTP calls and log lines
+  that read the span from `ctx` belong to the trace; settling the outcome (ack,
+  retry, fail) runs under it too.
+- **Attributes:** `messaging.system=pgkit`, `messaging.operation.type=process`,
+  `messaging.destination.name` (queue), `messaging.message.id` (job ID),
+  `pgkit.queue.job.attempt`, `pgkit.queue.job.max_attempts` and
+  `pgkit.queue.job.outcome` (`done`, `retry`, `failed` or `handled`).
+- **Errors:** a handler error is recorded on the span with status `Error`; the
+  outcome tells a retry from a terminal failure (non-retryable or attempts
+  exhausted). `Handled` leaves the status unset.
+
+Every attempt, a replay included, is a child of the enqueuer's span rather than a
+new trace linked to it: the job's whole history stays in one trace, each attempt
+told apart by its attempt attribute, at the cost of a trace that spans the retry
+delays. Workflow runs go through the same path: each activation of a run is a
+consumer span in the trace of the `Start` call, and child runs, started from an
+activation, join it too.
+
+With no TracerProvider configured the global no-op tracer costs a few small
+allocations per job, negligible beside the claim's database round trip, and the
+default no-op propagator stores nothing. Install a propagator, or nothing is
+stored even when spans are recorded.
 
 ## Admin UI Dashboard
 
