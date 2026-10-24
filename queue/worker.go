@@ -437,7 +437,7 @@ func (w *Worker) scan(ctx context.Context) scanResult {
 				break
 			}
 
-			w.settle(ctx, job, h(ctx, *job))
+			w.run(ctx, h, job)
 		}
 		if claimed == w.cfg.BatchSizePerQueue {
 			result.batchFilled = true
@@ -475,10 +475,20 @@ func (w *Worker) handBack(workerCtx context.Context, job *Job) {
 	}
 }
 
-// settle records the handler's outcome for job. It uses a context that shutdown
-// does not cancel, so a handler finishing while the worker stops still settles its
-// job instead of leaving it processing until the reaper takes it back.
-func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
+// run executes job under a consumer span that continues the enqueuer's trace, so
+// the handler and the settlement of its outcome are part of that trace.
+func (w *Worker) run(workerCtx context.Context, h Handler, job *Job) {
+	ctx, span := startJobSpan(workerCtx, job)
+	defer span.End()
+	handlerErr := h(ctx, *job)
+	recordJobOutcome(span, w.settle(ctx, job, handlerErr), handlerErr)
+}
+
+// settle records the handler's outcome for job and returns it. It uses a context
+// that shutdown does not cancel, so a handler finishing while the worker stops
+// still settles its job instead of leaving it processing until the reaper takes it
+// back.
+func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) string {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
 	defer cancel()
 	switch {
@@ -486,20 +496,25 @@ func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) {
 		if ackErr := w.client.Ack(ctx, job.ID); ackErr != nil {
 			w.client.logError(ctx, "queue ack failed", map[string]any{"id": job.ID, "error": ackErr.Error()})
 		}
+		return jobOutcomeDone
 	case IsHandled(handlerErr):
+		return jobOutcomeHandled
 	case IsNonRetryable(handlerErr):
 		if failErr := w.client.Fail(ctx, job.ID, handlerErr); failErr != nil {
 			w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
 		} else {
 			w.notifyJobFailed(ctx, job, handlerErr)
 		}
+		return jobOutcomeFailed
 	default:
 		delay := w.cfg.RetryDelay(*job, handlerErr)
 		if retryErr := w.client.Retry(ctx, job.ID, delay, handlerErr); retryErr != nil {
 			w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
 		} else if job.Attempts >= job.MaxAttempts {
 			w.notifyJobFailed(ctx, job, handlerErr)
+			return jobOutcomeFailed
 		}
+		return jobOutcomeRetry
 	}
 }
 

@@ -49,7 +49,7 @@ const maxSearchLength = 256
 
 // schemaVersion is the current version of the pgqueue schema.
 // Bump this when adding migrations.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Job represents a single queue job row.
 type Job struct {
@@ -69,6 +69,8 @@ type Job struct {
 	LastError   sql.NullString
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	traceContext sql.NullString
 }
 
 type AdvisoryLock struct {
@@ -301,6 +303,11 @@ CREATE TABLE IF NOT EXISTS pgqueue_meta (
 			return err
 		}
 	}
+	if currentVersion < 3 {
+		if err := c.migrateV3(ctx); err != nil {
+			return err
+		}
+	}
 
 	// Upsert version.
 	if _, err := c.db.ExecContext(ctx, `
@@ -356,6 +363,15 @@ func (c *Client) migrateV2(ctx context.Context) error {
 	return nil
 }
 
+// migrateV3 adds the W3C trace context of the enqueuing span. Jobs enqueued
+// without one, or before this migration, keep NULL and start a new trace.
+func (c *Client) migrateV3(ctx context.Context) error {
+	if _, err := c.db.ExecContext(ctx, `ALTER TABLE pgqueue_jobs ADD COLUMN IF NOT EXISTS trace_context JSONB`); err != nil {
+		return fmt.Errorf("pgqueue: migrate v3: %w", err)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Enqueue (P1 #6 params struct, P0 #4 DB NOW())
 // ---------------------------------------------------------------------------
@@ -399,27 +415,28 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 
 	var id int64
 	var err error
+	traceContext := injectTraceContext(ctx)
 
 	if p.AvailableAt == nil {
 		// P0 #4: Use DB NOW() for immediate jobs to avoid clock skew.
 		err = qe.QueryRowContext(ctx,
 			`WITH job AS (
-				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-				VALUES ($1, $2, 'pending', 0, $3, NOW())
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at, trace_context)
+				VALUES ($1, $2, 'pending', 0, $3, NOW(), $4::jsonb)
 				RETURNING id, queue_name
 			 )
 			 SELECT job.id FROM job, `+notifySQL("job"),
-			p.QueueName, p.Payload, p.MaxAttempts,
+			p.QueueName, p.Payload, p.MaxAttempts, traceContext,
 		).Scan(&id)
 	} else {
 		err = qe.QueryRowContext(ctx,
 			`WITH job AS (
-				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at)
-				VALUES ($1, $2, 'pending', 0, $3, $4)
+				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at, trace_context)
+				VALUES ($1, $2, 'pending', 0, $3, $4, $5::jsonb)
 				RETURNING id, queue_name
 			 )
 			 SELECT job.id FROM job, `+notifySQL("job"),
-			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(),
+			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(), traceContext,
 		).Scan(&id)
 	}
 	if err != nil {
@@ -474,7 +491,8 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 		 FROM next_job
 		 WHERE j.id = next_job.id
 		 RETURNING j.id, j.queue_name, j.payload, j.status, j.attempts, j.max_attempts, j.claims, j.available_at,
-		           j.claimed_by, j.claimed_at, j.done_at, j.last_error, j.created_at, j.updated_at`,
+		           j.claimed_by, j.claimed_at, j.done_at, j.last_error, j.created_at, j.updated_at,
+		           j.trace_context::text`,
 		queueName, worker,
 	)
 
@@ -482,7 +500,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 	scanErr := row.Scan(
 		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
 		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-		&j.CreatedAt, &j.UpdatedAt,
+		&j.CreatedAt, &j.UpdatedAt, &j.traceContext,
 	)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		if commitErr := tx.Commit(); commitErr != nil {
