@@ -102,8 +102,13 @@ func (c *Client) PurgeFinished(ctx context.Context, policy RetentionPolicy) (Ret
 		}
 	}
 
+	if result.Done > 0 {
+		c.emit(ctx, EventPurge, map[string]any{"status": StatusDone, "deleted": result.Done})
+	}
+	if result.Failed > 0 {
+		c.emit(ctx, EventPurge, map[string]any{"status": StatusFailed, "deleted": result.Failed})
+	}
 	if result.Done > 0 || result.Failed > 0 {
-		c.emit(ctx, EventPurge, map[string]any{"done": result.Done, "failed": result.Failed})
 		c.logInfo(ctx, "queue purged finished jobs", map[string]any{"done": result.Done, "failed": result.Failed})
 	}
 	return result, nil
