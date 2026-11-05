@@ -49,7 +49,7 @@ const maxSearchLength = 256
 
 // schemaVersion is the current version of the pgqueue schema.
 // Bump this when adding migrations.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Job represents a single queue job row.
 type Job struct {
@@ -308,6 +308,11 @@ CREATE TABLE IF NOT EXISTS pgqueue_meta (
 			return err
 		}
 	}
+	if currentVersion < 4 {
+		if err := c.migrateV4(ctx); err != nil {
+			return err
+		}
+	}
 
 	// Upsert version.
 	if _, err := c.db.ExecContext(ctx, `
@@ -368,6 +373,18 @@ func (c *Client) migrateV2(ctx context.Context) error {
 func (c *Client) migrateV3(ctx context.Context) error {
 	if _, err := c.db.ExecContext(ctx, `ALTER TABLE pgqueue_jobs ADD COLUMN IF NOT EXISTS trace_context JSONB`); err != nil {
 		return fmt.Errorf("pgqueue: migrate v3: %w", err)
+	}
+	return nil
+}
+
+// migrateV4 indexes finished jobs by age, so that PurgeFinished finds expired
+// jobs without scanning the table.
+func (c *Client) migrateV4(ctx context.Context) error {
+	if _, err := c.db.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_pgqueue_finished
+ON pgqueue_jobs(status, updated_at)
+WHERE status IN ('done', 'failed')`); err != nil {
+		return fmt.Errorf("pgqueue: migrate v4: %w", err)
 	}
 	return nil
 }

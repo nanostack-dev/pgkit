@@ -138,12 +138,46 @@ or failed and replayed, and claimed elsewhere cannot touch the new claim. The cl
 number counts every claim and only grows; `attempts` stays the retry budget, which
 `SnoozeTx` refunds and a replay resets. Durations and timeouts keep sub-second
 precision; `Reap` refuses a non-positive visibility timeout. `EnsureSchema` adds
-the `claims` column to existing queues (schema version 2) and the `trace_context`
-column (schema version 3, see [Tracing](#tracing)).
+the `claims` column to existing queues (schema version 2), the `trace_context`
+column (schema version 3, see [Tracing](#tracing)) and the finished-jobs index
+(schema version 4, see [Retention](#retention)).
 
 `client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
 `LISTEN` connection for other keys: a subscription wakes when a notification for
 one of its keys commits, and when the listener reconnects.
+
+### Retention
+
+Done and failed jobs stay in `pgqueue_jobs` until something deletes them. Without
+retention the table grows with every job ever run, and each `ListJobs`, `CountJobs`
+and dashboard read gets slower. `RunRetention` deletes them on a schedule, for every
+queue in the database:
+
+```go
+go client.RunRetention(ctx, queue.RetentionPolicy{
+	KeepDone:   7 * 24 * time.Hour,
+	KeepFailed: 30 * 24 * time.Hour,
+})
+```
+
+With `fx/queue`, set `queuefx.Options{Retention: &policy}` instead; the app then
+fails to start on an invalid policy, and the loop stops with the app.
+
+- Age is measured from the job's last update (`updated_at`), so a job is kept for
+  its full period after it finishes, however long it waited before.
+- A zero `KeepDone` or `KeepFailed` keeps that status forever; the policy must set
+  at least one. Pending and processing jobs are never deleted.
+- It purges at start and then every `Interval` (default one hour), in batches of
+  `BatchSize` jobs (default 1000), each batch its own transaction. The first run on
+  a large table therefore deletes its backlog without one long lock.
+- Batches select with `FOR UPDATE SKIP LOCKED`, so every replica may run it. A
+  failed purge is logged and retried at the next interval.
+- `PurgeFinished` runs one purge and returns the counts. `Purge` still deletes one
+  status at a time on demand.
+
+The purge queries name the status literally, so they use the partial index
+`idx_pgqueue_finished (status, updated_at) WHERE status IN ('done', 'failed')`
+under any plan, generic plans included.
 
 ### Tracing
 
