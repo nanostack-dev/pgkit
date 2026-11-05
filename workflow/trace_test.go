@@ -81,13 +81,21 @@ func TestRunActivationsAndChildrenJoinTheStartersTrace(t *testing.T) {
 		}
 	}
 
-	activations := map[string]int{}
-	for _, span := range recorder.Ended() {
-		if span.SpanContext().TraceID() == traceID && span.SpanKind() == trace.SpanKindConsumer {
-			activations[span.Name()]++
+	// The last activation's span ends after the worker settles its job, which can
+	// be after the run's result is visible.
+	var activations map[string]int
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		activations = map[string]int{}
+		for _, span := range recorder.Ended() {
+			if span.SpanContext().TraceID() == traceID && span.SpanKind() == trace.SpanKindConsumer {
+				activations[span.Name()]++
+			}
 		}
-	}
-	if activations["pgkit.queue pgworkflow:traced-parent"] < 2 || activations["pgkit.queue pgworkflow:traced-child"] < 1 {
-		t.Fatalf("consumer spans in the starter's trace = %v, want parent activations around the sleep and the child", activations)
+		if activations["pgkit.queue pgworkflow:traced-parent"] >= 2 && activations["pgkit.queue pgworkflow:traced-child"] >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("consumer spans in the starter's trace = %v, want parent activations around the sleep and the child", activations)
+		}
 	}
 }
