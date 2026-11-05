@@ -1,0 +1,20 @@
+# pgkit's CI as Dagger checks (.github/workflows/ci.yml). `dagger check` runs
+# them the same way on a laptop and in CI.
+
+[modules.pgkit]
+source = ".dagger/modules/pgkit"
+
+[modules.pgkit.settings]
+goImage = "golang:1.27.0-bookworm"
+
+[modules.go]
+source = "dagger.io/go"
+
+[modules.go.settings]
+# Tests start Postgres with testcontainers: run them in pgkit's base.
+base = "dag://pgkit/go-test-base"
+# As before: the race detector, no test cache.
+goflags = "-race -count=1"
+
+[modules.golangci-lint]
+source = "dagger.io/go/golangci-lint"

@@ -226,3 +226,7 @@ type Logger interface {
 ```
 
 Use `SetLogger(...)` to plug your own logger.
+
+## CI
+
+`dagger check` runs lint (`golangci-lint`) and the tests (`go test -race -count=1`, Postgres through testcontainers) exactly as CI does ([dagger.toml](dagger.toml)). The tests run in `.dagger/modules/pgkit`'s base, which brings its own Docker daemon. Install the pinned CLI with `./scripts/ci/install-dagger.sh ~/.local/bin` (Docker must run). `dagger check --go-package=queue` or `--go-test=TestName` narrows the run.

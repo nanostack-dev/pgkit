@@ -1,0 +1,43 @@
+pub description = "The Go test base for pgkit: the official go module runs the tests in it"
+
+"""
+pgkit's tests start Postgres with testcontainers. The official dagger.io/go
+module runs them in goTestBase (dagger.toml: [modules.go.settings] base).
+"""
+type Pgkit {
+  """
+  Go toolchain image, with cgo for the race detector. Keep it equal to the
+  toolchain line in go.mod.
+  """
+  pub goImage: String!
+
+  new(goImage: String! = "golang:1.27.0-bookworm") {
+    self.goImage = goImage
+    self
+  }
+
+  """
+  A Docker daemon for testcontainers, one per run; pulled images persist.
+  """
+  pub docker: Service! {
+    container
+      .from("docker:29-dind")
+      .withMountedCache("/var/lib/docker", cacheVolume("pgkit-dind"), sharing: CacheSharingMode.PRIVATE)
+      .withEnvVariable("DOCKER_TLS_CERTDIR", "")
+      .withExposedPort(2375)
+      .asService(args: ["--host=tcp://0.0.0.0:2375", "--tls=false"], useEntrypoint: true, insecureRootCapabilities: true)
+  }
+
+  """
+  The base the official go module tests in: Go with cgo, bound to the
+  Docker daemon. testcontainers finds it through DOCKER_HOST and publishes
+  container ports on that host.
+  """
+  pub goTestBase: Container! {
+    container
+      .from(goImage)
+      .withServiceBinding("docker", docker)
+      .withEnvVariable("DOCKER_HOST", "tcp://docker:2375")
+      .withEnvVariable("TESTCONTAINERS_RYUK_DISABLED", "true")
+  }
+}
