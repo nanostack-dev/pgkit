@@ -17,6 +17,8 @@ type Params struct {
 type Options struct {
 	EnsureSchema bool
 	ClientHooks  []qpkg.Hook
+	// Retention, when set, purges finished jobs from start to stop.
+	Retention *qpkg.RetentionPolicy
 }
 
 func Module(opts Options) fx.Option {
@@ -32,6 +34,35 @@ func Module(opts Options) fx.Option {
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
 					return client.EnsureSchema(ctx)
+				},
+			})
+		}),
+		fx.Invoke(func(lc fx.Lifecycle, client *qpkg.Client) {
+			if opts.Retention == nil {
+				return
+			}
+			policy := *opts.Retention
+			retentionCtx, stopRetention := context.WithCancel(context.Background())
+			stopped := make(chan struct{})
+			lc.Append(fx.Hook{
+				OnStart: func(context.Context) error {
+					if err := policy.Validate(); err != nil {
+						return err
+					}
+					go func() {
+						defer close(stopped)
+						_ = client.RunRetention(retentionCtx, policy)
+					}()
+					return nil
+				},
+				OnStop: func(ctx context.Context) error {
+					stopRetention()
+					select {
+					case <-stopped:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				},
 			})
 		}),
