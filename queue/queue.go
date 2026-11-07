@@ -521,7 +521,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 	)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		if commitErr := tx.Commit(); commitErr != nil {
-			return nil, false, fmt.Errorf("pgqueue: commit empty claim tx: %w", commitErr)
+			return nil, false, fmt.Errorf("pgqueue: commit empty claim tx: %w", joinContextErr(ctx, commitErr))
 		}
 		return nil, false, nil
 	}
@@ -530,7 +530,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
-		return nil, false, fmt.Errorf("pgqueue: commit claim tx: %w", commitErr)
+		return nil, false, fmt.Errorf("pgqueue: commit claim tx: %w", joinContextErr(ctx, commitErr))
 	}
 
 	c.emit(ctx, EventClaim, map[string]any{"id": j.ID, "queue": queueName, "worker": worker})
@@ -1086,4 +1086,14 @@ func ExponentialBackoff(base time.Duration, attempt int, cap time.Duration) time
 // secureTokenEqual performs a constant-time comparison of two token strings.
 func secureTokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// joinContextErr keeps the context error next to a commit failure. When the
+// claim context expires, database/sql rolls the tx back on its own and Commit
+// returns sql.ErrTxDone, which hides that the real cause was the deadline.
+func joinContextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, ctxErr)
+	}
+	return err
 }

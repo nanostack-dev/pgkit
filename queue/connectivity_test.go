@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -90,5 +91,24 @@ func TestIsConnectivityError(t *testing.T) {
 				t.Fatalf("isConnectivityError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestJoinContextErrClassifiesCommitAfterDeadline(t *testing.T) {
+	t.Parallel()
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	afterDeadline := fmt.Errorf("pgqueue: commit empty claim tx: %w", joinContextErr(expired, sql.ErrTxDone))
+	if !isConnectivityError(afterDeadline) {
+		t.Fatalf("commit after claim deadline must log at warn: %v", afterDeadline)
+	}
+	if !errors.Is(afterDeadline, sql.ErrTxDone) {
+		t.Fatalf("original commit error must stay matchable: %v", afterDeadline)
+	}
+
+	liveCommit := fmt.Errorf("pgqueue: commit claim tx: %w", joinContextErr(context.Background(), sql.ErrTxDone))
+	if isConnectivityError(liveCommit) {
+		t.Fatalf("ErrTxDone with a live context is a real fault and must stay at error: %v", liveCommit)
 	}
 }
