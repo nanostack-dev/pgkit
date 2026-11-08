@@ -546,7 +546,7 @@ func TestEnsureSchemaUpgradesAVersionOneQueue(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE pgqueue_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
 		t.Fatalf("create meta: %v", err)
 	}
-	if err := q.migrateV1(ctx); err != nil {
+	if err := migrateV1(ctx, db); err != nil {
 		t.Fatalf("migrate v1: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO pgqueue_meta VALUES ('schema_version', '1');

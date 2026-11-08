@@ -207,11 +207,12 @@ func TestPurgeFinishedUsesFinishedIndexUnderGenericPlans(t *testing.T) {
 		}
 	}
 
-	for status, query := range map[JobStatus]string{
-		StatusDone:   deleteExpiredDoneSQL,
-		StatusFailed: deleteExpiredFailedSQL,
+	for state, query := range map[JobState]string{
+		StateCompleted: deleteExpiredCompletedSQL,
+		StateDiscarded: deleteExpiredDiscardedSQL,
+		StateCancelled: deleteExpiredCancelledSQL,
 	} {
-		t.Run(string(status), func(t *testing.T) {
+		t.Run(string(state), func(t *testing.T) {
 			if _, err := conn.ExecContext(ctx, `PREPARE purge_plan(float8, int) AS `+query); err != nil {
 				t.Fatalf("prepare: %v", err)
 			}
@@ -230,8 +231,8 @@ func TestPurgeFinishedUsesFinishedIndexUnderGenericPlans(t *testing.T) {
 				}
 				plan.WriteString(line + "\n")
 			}
-			if !strings.Contains(plan.String(), "idx_pgqueue_finished") {
-				t.Fatalf("plan does not use idx_pgqueue_finished:\n%s", plan.String())
+			if !strings.Contains(plan.String(), "idx_pgqueue_finalized") {
+				t.Fatalf("plan does not use idx_pgqueue_finalized:\n%s", plan.String())
 			}
 		})
 	}

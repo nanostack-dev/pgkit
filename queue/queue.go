@@ -33,7 +33,8 @@ var (
 // Types
 // ---------------------------------------------------------------------------
 
-// JobStatus represents the lifecycle state of a job.
+// JobStatus is the coarse legacy status of a job, kept in sync with its JobState
+// for code written before job states existed. Prefer Job.State.
 type JobStatus string
 
 const (
@@ -47,15 +48,16 @@ const defaultMaxAttempts = 5
 
 const maxSearchLength = 256
 
-// schemaVersion is the current version of the pgqueue schema.
-// Bump this when adding migrations.
-const schemaVersion = 4
-
 // Job represents a single queue job row.
 type Job struct {
-	ID          int64
-	QueueName   string
-	Payload     []byte
+	ID        int64
+	QueueName string
+	Payload   []byte
+	// State is the job's lifecycle state.
+	State JobState
+	// Status is the legacy projection of State: pending (available, scheduled,
+	// retryable), processing (running), done (completed) or failed (cancelled,
+	// discarded).
 	Status      JobStatus
 	Attempts    int
 	MaxAttempts int
@@ -65,10 +67,16 @@ type Job struct {
 	AvailableAt time.Time
 	ClaimedBy   sql.NullString
 	ClaimedAt   sql.NullTime
-	DoneAt      sql.NullTime
-	LastError   sql.NullString
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// LeaseExpiresAt is when the leader's rescuer takes back a running job claimed
+	// by a Worker; Heartbeat extends it. Claim leaves it empty.
+	LeaseExpiresAt sql.NullTime
+	// CancelRequestedAt is set by Cancel on a running job: its outcome is recorded
+	// as cancelled unless the handler succeeds.
+	CancelRequestedAt sql.NullTime
+	DoneAt            sql.NullTime
+	LastError         sql.NullString
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 
 	traceContext sql.NullString
 }
@@ -98,7 +106,8 @@ type EnqueueParams struct {
 type ListJobsParams struct {
 	Limit     int       // required, must be > 0
 	QueueName string    // optional filter
-	Status    JobStatus // optional filter
+	State     JobState  // optional filter
+	Status    JobStatus // optional legacy filter; prefer State
 	Offset    int       // optional pagination offset
 	Search    string    // optional full-text filter over queue_name/payload/last_error
 }
@@ -110,10 +119,11 @@ type PurgeParams struct {
 	Limit     int           // optional: max rows to delete per call (0 = no limit)
 }
 
-// ReapResult holds counts from a reap operation.
+// ReapResult holds counts from a reap or rescue.
 type ReapResult struct {
-	Requeued int64 // jobs moved back to pending
-	Failed   int64 // jobs moved to failed (attempts exhausted)
+	Requeued  int64 // jobs made available again
+	Failed    int64 // jobs discarded (attempts exhausted)
+	Cancelled int64 // jobs cancelled (cancel requested while running)
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +141,7 @@ const (
 	EventFail    EventKind = "fail"
 	EventReap    EventKind = "reap"
 	EventPurge   EventKind = "purge"
+	EventCancel  EventKind = "cancel"
 )
 
 // Hook is called after each queue operation completes.
@@ -167,10 +178,12 @@ func (noopLogger) Error(context.Context, string, map[string]any) {}
 
 // Client is the main pgqueue client.
 type Client struct {
-	db       *sql.DB
-	hooks    []Hook
-	log      Logger
-	notifier *notifier
+	db         *sql.DB
+	hooks      []Hook
+	log        Logger
+	notifier   *notifier
+	maintainer *maintainer
+	schema     schemaSettings
 }
 
 // New creates a new pgqueue Client.
@@ -178,8 +191,9 @@ func New(db *sql.DB, hooks ...Hook) (*Client, error) {
 	if db == nil {
 		return nil, ErrNilDB
 	}
-	c := &Client{db: db, hooks: hooks, log: noopLogger{}}
+	c := &Client{db: db, hooks: hooks, log: noopLogger{}, schema: defaultSchemaSettings()}
 	c.notifier = newNotifier(c)
+	c.maintainer = newMaintainer(c)
 	return c, nil
 }
 
@@ -265,131 +279,6 @@ func (c *Client) emit(ctx context.Context, kind EventKind, meta map[string]any) 
 }
 
 // ---------------------------------------------------------------------------
-// Schema management (P2 #10)
-// ---------------------------------------------------------------------------
-
-// EnsureSchema creates the pgqueue tables and applies incremental migrations.
-func (c *Client) EnsureSchema(ctx context.Context) error {
-	if c == nil || c.db == nil {
-		return ErrNilDB
-	}
-
-	// Create meta table for version tracking.
-	if _, err := c.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS pgqueue_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-)`); err != nil {
-		return fmt.Errorf("pgqueue: create meta table: %w", err)
-	}
-
-	// Read current version.
-	var currentVersion int
-	err := c.db.QueryRowContext(ctx,
-		`SELECT value::int FROM pgqueue_meta WHERE key = 'schema_version'`,
-	).Scan(&currentVersion)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("pgqueue: read schema version: %w", err)
-	}
-
-	// Apply migrations in order.
-	if currentVersion < 1 {
-		if err := c.migrateV1(ctx); err != nil {
-			return err
-		}
-	}
-	if currentVersion < 2 {
-		if err := c.migrateV2(ctx); err != nil {
-			return err
-		}
-	}
-	if currentVersion < 3 {
-		if err := c.migrateV3(ctx); err != nil {
-			return err
-		}
-	}
-	if currentVersion < 4 {
-		if err := c.migrateV4(ctx); err != nil {
-			return err
-		}
-	}
-
-	// Upsert version.
-	if _, err := c.db.ExecContext(ctx, `
-INSERT INTO pgqueue_meta (key, value) VALUES ('schema_version', $1)
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-		fmt.Sprintf("%d", schemaVersion),
-	); err != nil {
-		return fmt.Errorf("pgqueue: upsert schema version: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Client) migrateV1(ctx context.Context) error {
-	_, err := c.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS pgqueue_jobs (
-    id BIGSERIAL PRIMARY KEY,
-    queue_name TEXT NOT NULL,
-    payload BYTEA NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL DEFAULT 5,
-    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    claimed_by TEXT,
-    claimed_at TIMESTAMPTZ,
-    done_at TIMESTAMPTZ,
-    last_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_pgqueue_jobs_status CHECK (status IN ('pending','processing','done','failed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_pgqueue_pending_due
-ON pgqueue_jobs(queue_name, available_at, id)
-WHERE status = 'pending';
-
-CREATE INDEX IF NOT EXISTS idx_pgqueue_processing
-ON pgqueue_jobs(queue_name, claimed_at)
-WHERE status = 'processing';
-`)
-	if err != nil {
-		return fmt.Errorf("pgqueue: migrate v1: %w", err)
-	}
-	return nil
-}
-
-// migrateV2 adds the claim counter that fences handlers. Unlike attempts, which
-// a replay resets and a snooze refunds, it only grows.
-func (c *Client) migrateV2(ctx context.Context) error {
-	if _, err := c.db.ExecContext(ctx, `ALTER TABLE pgqueue_jobs ADD COLUMN IF NOT EXISTS claims INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return fmt.Errorf("pgqueue: migrate v2: %w", err)
-	}
-	return nil
-}
-
-// migrateV3 adds the W3C trace context of the enqueuing span. Jobs enqueued
-// without one, or before this migration, keep NULL and start a new trace.
-func (c *Client) migrateV3(ctx context.Context) error {
-	if _, err := c.db.ExecContext(ctx, `ALTER TABLE pgqueue_jobs ADD COLUMN IF NOT EXISTS trace_context JSONB`); err != nil {
-		return fmt.Errorf("pgqueue: migrate v3: %w", err)
-	}
-	return nil
-}
-
-// migrateV4 indexes finished jobs by age, so that PurgeFinished finds expired
-// jobs without scanning the table.
-func (c *Client) migrateV4(ctx context.Context) error {
-	if _, err := c.db.ExecContext(ctx, `
-CREATE INDEX IF NOT EXISTS idx_pgqueue_finished
-ON pgqueue_jobs(status, updated_at)
-WHERE status IN ('done', 'failed')`); err != nil {
-		return fmt.Errorf("pgqueue: migrate v4: %w", err)
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
 // Enqueue (P1 #6 params struct, P0 #4 DB NOW())
 // ---------------------------------------------------------------------------
 
@@ -430,32 +319,24 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 		p.MaxAttempts = defaultMaxAttempts
 	}
 
-	var id int64
-	var err error
-	traceContext := injectTraceContext(ctx)
-
-	if p.AvailableAt == nil {
-		// P0 #4: Use DB NOW() for immediate jobs to avoid clock skew.
-		err = qe.QueryRowContext(ctx,
-			`WITH job AS (
-				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at, trace_context)
-				VALUES ($1, $2, 'pending', 0, $3, NOW(), $4::jsonb)
-				RETURNING id, queue_name
-			 )
-			 SELECT job.id FROM job, `+notifySQL("job"),
-			p.QueueName, p.Payload, p.MaxAttempts, traceContext,
-		).Scan(&id)
-	} else {
-		err = qe.QueryRowContext(ctx,
-			`WITH job AS (
-				INSERT INTO pgqueue_jobs(queue_name, payload, status, attempts, max_attempts, available_at, trace_context)
-				VALUES ($1, $2, 'pending', 0, $3, $4, $5::jsonb)
-				RETURNING id, queue_name
-			 )
-			 SELECT job.id FROM job, `+notifySQL("job"),
-			p.QueueName, p.Payload, p.MaxAttempts, p.AvailableAt.UTC(), traceContext,
-		).Scan(&id)
+	var availableAt any
+	if p.AvailableAt != nil {
+		availableAt = p.AvailableAt.UTC()
 	}
+
+	var id int64
+	err := qe.QueryRowContext(ctx,
+		`WITH job AS (
+			INSERT INTO pgqueue_jobs(queue_name, payload, state, attempts, max_attempts, available_at, trace_context)
+			SELECT $1, $2,
+			       CASE WHEN at <= NOW() THEN 'available' ELSE 'scheduled' END,
+			       0, $3, at, $5::jsonb
+			FROM (SELECT COALESCE($4::timestamptz, NOW()) AS at) availability
+			RETURNING id, queue_name
+		 )
+		 SELECT job.id FROM job, `+notifySQL("job"),
+		p.QueueName, p.Payload, p.MaxAttempts, availableAt, injectTraceContext(ctx),
+	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("pgqueue: enqueue: %w", err)
 	}
@@ -470,9 +351,23 @@ func enqueueCore(ctx context.Context, qe queryExecer, p EnqueueParams, c *Client
 // Claim (P1 #7: bool return for empty queue)
 // ---------------------------------------------------------------------------
 
-// Claim atomically claims the next available job.
+// Claim atomically claims the next due job: available, or scheduled and retryable
+// jobs whose time has come, so claiming never waits for the leader's scheduler.
 // Returns (job, true, nil) on success, (nil, false, nil) when no job is available.
+// The claim carries no lease: the leader's rescuer takes it back after
+// MaintenanceConfig.RescueAfter, or a Reap with a shorter visibility timeout does.
 func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job, found bool, err error) {
+	return c.claim(ctx, queueName, worker, 0)
+}
+
+// claim takes the next due job of queueName for worker. A positive lease sets
+// lease_expires_at, after which the leader's rescuer takes the job back.
+//
+// The status predicate repeats the state filter (the sync trigger keeps them
+// equivalent) so that the legacy index idx_pgqueue_pending_due serves the claim
+// until CompleteSchema has built idx_pgqueue_claimable. The contract migration
+// removes it with the status column.
+func (c *Client) claim(ctx context.Context, queueName, worker string, lease time.Duration) (*Job, bool, error) {
 	if c == nil || c.db == nil {
 		return nil, false, ErrNilDB
 	}
@@ -491,6 +386,7 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 			SELECT id
 			FROM pgqueue_jobs
 			WHERE queue_name = $1
+			  AND state IN ('available', 'scheduled', 'retryable')
 			  AND status = 'pending'
 			  AND available_at <= NOW()
 			  AND attempts < max_attempts
@@ -499,26 +395,22 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 			LIMIT 1
 		 )
 		 UPDATE pgqueue_jobs j
-		 SET status = 'processing',
+		 SET state = 'running',
 		     attempts = attempts + 1,
 		     claims = claims + 1,
 		     claimed_by = $2,
 		     claimed_at = NOW(),
+		     lease_expires_at = CASE WHEN $3::float8 > 0 THEN NOW() + make_interval(secs => $3::float8) END,
+		     cancel_requested_at = NULL,
 		     updated_at = NOW()
 		 FROM next_job
 		 WHERE j.id = next_job.id
-		 RETURNING j.id, j.queue_name, j.payload, j.status, j.attempts, j.max_attempts, j.claims, j.available_at,
-		           j.claimed_by, j.claimed_at, j.done_at, j.last_error, j.created_at, j.updated_at,
-		           j.trace_context::text`,
-		queueName, worker,
+		 RETURNING `+jobColumns("j")+`, j.trace_context::text`,
+		queueName, worker, lease.Seconds(),
 	)
 
 	j := &Job{}
-	scanErr := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
-		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-		&j.CreatedAt, &j.UpdatedAt, &j.traceContext,
-	)
+	scanErr := row.Scan(append(j.scanTargets(), &j.traceContext)...)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		if commitErr := tx.Commit(); commitErr != nil {
 			return nil, false, fmt.Errorf("pgqueue: commit empty claim tx: %w", joinContextErr(ctx, commitErr))
@@ -535,6 +427,36 @@ func (c *Client) Claim(ctx context.Context, queueName, worker string) (job *Job,
 
 	c.emit(ctx, EventClaim, map[string]any{"id": j.ID, "queue": queueName, "worker": worker})
 	return j, true, nil
+}
+
+// jobColumns lists the columns Job.scanTargets reads, qualified by alias when it
+// is not empty. A job that finished before schema v5 has no state until
+// CompleteSchema backfills it, so the state is derived from status for it.
+func jobColumns(alias string) string {
+	prefix := ""
+	if alias != "" {
+		prefix = alias + "."
+	}
+	columns := []string{
+		"id", "queue_name", "payload", "state", "status", "attempts", "max_attempts", "claims",
+		"available_at", "claimed_by", "claimed_at", "lease_expires_at", "cancel_requested_at",
+		"done_at", "last_error", "created_at", "updated_at",
+	}
+	for i, column := range columns {
+		columns[i] = prefix + column
+		if column == "state" {
+			columns[i] = fmt.Sprintf("COALESCE(%[1]sstate, pgqueue_state_of_status(%[1]sstatus, %[1]savailable_at, %[1]sattempts))", prefix)
+		}
+	}
+	return strings.Join(columns, ", ")
+}
+
+func (j *Job) scanTargets() []any {
+	return []any{
+		&j.ID, &j.QueueName, &j.Payload, &j.State, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
+		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.LeaseExpiresAt, &j.CancelRequestedAt,
+		&j.DoneAt, &j.LastError, &j.CreatedAt, &j.UpdatedAt,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -564,8 +486,8 @@ func (c *Client) AckTx(ctx context.Context, tx *sql.Tx, id int64) error {
 func ackCore(ctx context.Context, exec execer, id int64, c *Client) error {
 	res, err := exec.ExecContext(ctx,
 		`UPDATE pgqueue_jobs
-		 SET status = 'done', done_at = NOW(), claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
-		 WHERE id = $1 AND status = 'processing'`,
+		 SET state = 'completed', done_at = NOW(), claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+		 WHERE id = $1 AND state = 'running'`,
 		id,
 	)
 	if err != nil {
@@ -607,42 +529,61 @@ func (c *Client) RetryTx(ctx context.Context, tx *sql.Tx, id int64, delay time.D
 	return retryCore(ctx, tx, id, delay, cause, c)
 }
 
-func retryCore(ctx context.Context, exec execer, id int64, delay time.Duration, cause error, c *Client) error {
+func retryCore(ctx context.Context, exec queryExecer, id int64, delay time.Duration, cause error, c *Client) error {
+	_, err := retryJob(ctx, exec, id, delay, cause, c)
+	return err
+}
+
+// retryJob settles a failed attempt and returns the state it left the job in:
+// cancelled when a cancel was requested, discarded once attempts are exhausted,
+// otherwise retryable until delay has passed (available for no delay).
+func retryJob(ctx context.Context, exec queryExecer, id int64, delay time.Duration, cause error, c *Client) (JobState, error) {
 	var errMsg *string
 	if cause != nil {
 		s := cause.Error()
 		errMsg = &s
 	}
 
-	// Use a single atomic UPDATE that checks state and decides outcome.
-	// If attempts >= max_attempts, move to failed (zombie prevention).
-	// We use DB NOW() + interval for the delay to maintain clock consistency.
-	res, err := exec.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-		 SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
-		     available_at = CASE WHEN attempts >= max_attempts THEN available_at ELSE NOW() + make_interval(secs => $2) END,
-		     last_error = COALESCE($3, last_error),
+	var state JobState
+	err := exec.QueryRowContext(ctx,
+		`WITH decided AS (
+			SELECT id, CASE
+			    WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+			    WHEN attempts >= max_attempts THEN 'discarded'
+			    WHEN $2::float8 <= 0 THEN 'available'
+			    ELSE 'retryable'
+			END AS next_state
+			FROM pgqueue_jobs
+			WHERE id = $1 AND state = 'running'
+			FOR UPDATE
+		 )
+		 UPDATE pgqueue_jobs j
+		 SET state = decided.next_state,
+		     available_at = CASE WHEN decided.next_state IN ('available', 'retryable')
+		                         THEN NOW() + make_interval(secs => $2::float8) ELSE j.available_at END,
+		     last_error = COALESCE($3, j.last_error),
 		     claimed_by = NULL,
 		     claimed_at = NULL,
-		     done_at = CASE WHEN attempts >= max_attempts THEN NOW() ELSE NULL END,
+		     done_at = CASE WHEN decided.next_state IN ('cancelled', 'discarded') THEN NOW() END,
 		     updated_at = NOW()
-		 WHERE id = $1 AND status = 'processing'`,
+		 FROM decided
+		 WHERE j.id = decided.id
+		 RETURNING j.state`,
 		id,
 		delay.Seconds(),
 		errMsg,
-	)
-	if err != nil {
-		return fmt.Errorf("pgqueue: retry: %w", err)
+	).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("pgqueue: retry id=%d: %w", id, ErrJobNotFound)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("pgqueue: retry id=%d: %w", id, ErrJobNotFound)
+	if err != nil {
+		return "", fmt.Errorf("pgqueue: retry: %w", err)
 	}
 
 	if c != nil {
-		c.emit(ctx, EventRetry, map[string]any{"id": id})
+		c.emit(ctx, EventRetry, map[string]any{"id": id, "state": state})
 	}
-	return nil
+	return state, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -669,34 +610,44 @@ func (c *Client) FailTx(ctx context.Context, tx *sql.Tx, id int64, cause error) 
 	return failCore(ctx, tx, id, cause, c)
 }
 
-func failCore(ctx context.Context, exec execer, id int64, cause error, c *Client) error {
+func failCore(ctx context.Context, exec queryExecer, id int64, cause error, c *Client) error {
+	_, err := failJob(ctx, exec, id, cause, c)
+	return err
+}
+
+// failJob discards a running job, or cancels it when a cancel was requested, and
+// returns the state it left the job in.
+func failJob(ctx context.Context, exec queryExecer, id int64, cause error, c *Client) (JobState, error) {
 	var errMsg *string
 	if cause != nil {
 		s := cause.Error()
 		errMsg = &s
 	}
 
-	res, err := exec.ExecContext(ctx,
+	var state JobState
+	err := exec.QueryRowContext(ctx,
 		`UPDATE pgqueue_jobs
-		 SET status = 'failed',
+		 SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'discarded' END,
 		     last_error = $2,
+		     claimed_by = NULL,
+		     claimed_at = NULL,
 		     done_at = NOW(),
 		     updated_at = NOW()
-		 WHERE id = $1 AND status = 'processing'`,
+		 WHERE id = $1 AND state = 'running'
+		 RETURNING state`,
 		id, errMsg,
-	)
-	if err != nil {
-		return fmt.Errorf("pgqueue: fail: %w", err)
+	).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("pgqueue: fail id=%d: %w", id, ErrJobNotFound)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("pgqueue: fail id=%d: %w", id, ErrJobNotFound)
+	if err != nil {
+		return "", fmt.Errorf("pgqueue: fail: %w", err)
 	}
 
 	if c != nil {
-		c.emit(ctx, EventFail, map[string]any{"id": id})
+		c.emit(ctx, EventFail, map[string]any{"id": id, "state": state})
 	}
-	return nil
+	return state, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -718,8 +669,8 @@ type ReapParams struct {
 }
 
 // Reap reclaims stuck jobs as ReapParams selects them. Jobs with remaining attempts
-// are requeued to pending; exhausted jobs are failed. VisibilityTimeout must be
-// positive.
+// become available; exhausted jobs are discarded and jobs with a cancel request
+// cancelled. VisibilityTimeout must be positive.
 func (c *Client) Reap(ctx context.Context, p ReapParams) (ReapResult, error) {
 	if c == nil || c.db == nil {
 		return ReapResult{}, ErrNilDB
@@ -735,50 +686,108 @@ func (c *Client) Reap(ctx context.Context, p ReapParams) (ReapResult, error) {
 		}
 		queueNames = string(encoded)
 	}
-	const stuck = `status = 'processing'
-			  AND claimed_at < NOW() - make_interval(secs => $1)
-			  AND ($2::jsonb IS NULL OR queue_name IN (SELECT jsonb_array_elements_text($2::jsonb)))`
+	result, err := c.rescue(ctx, `state = 'running' AND status = 'processing'
+		  AND claimed_at < NOW() - make_interval(secs => $1::float8)
+		  AND ($2::jsonb IS NULL OR queue_name IN (SELECT jsonb_array_elements_text($2::jsonb)))`,
+		"reaped: visibility timeout exceeded",
+		p.VisibilityTimeout.Seconds(), queueNames,
+	)
+	if err != nil {
+		return ReapResult{}, fmt.Errorf("pgqueue: reap: %w", err)
+	}
+	c.emit(ctx, EventReap, map[string]any{"requeued": result.Requeued, "failed": result.Failed, "cancelled": result.Cancelled})
+	return result, nil
+}
 
-	resRequeue, err := c.db.ExecContext(ctx,
-		`WITH requeued AS (
-			UPDATE pgqueue_jobs
-			SET status = 'pending',
+// rescuedJob is one job a rescue took back from a running claim.
+type rescuedJob struct {
+	queueName string
+	state     JobState
+}
+
+// rescue takes back the running jobs that match stuck, a condition on
+// pgqueue_jobs whose parameters are args: those with attempts left become
+// available and notify their queue, exhausted ones are discarded with reason,
+// and those with a cancel request are cancelled.
+func (c *Client) rescue(ctx context.Context, stuck, reason string, args ...any) (ReapResult, error) {
+	jobs, err := c.rescueJobs(ctx, stuck, 0, reason, args...)
+	return countRescued(jobs), err
+}
+
+// rescueJobs takes back at most limit jobs (every one when limit is 0) that match
+// stuck. stuck must be a plain condition on the row, never a subquery: it sits in
+// the locking scan, so PostgreSQL rechecks it against the newest version of each
+// row it locks. A subquery result is computed once from the statement snapshot
+// and reused by that recheck, so a job settled after the snapshot would still
+// match and be revived.
+func (c *Client) rescueJobs(ctx context.Context, stuck string, limit int, reason string, args ...any) ([]rescuedJob, error) {
+	limitParam := fmt.Sprintf("$%d", len(args)+1)
+	reasonParam := fmt.Sprintf("$%d", len(args)+2)
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+	rows, err := c.db.QueryContext(ctx,
+		`WITH stuck AS (
+			SELECT id, CASE
+			    WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+			    WHEN attempts >= max_attempts THEN 'discarded'
+			    ELSE 'available'
+			END AS next_state
+			FROM pgqueue_jobs
+			WHERE `+stuck+`
+			ORDER BY id
+			LIMIT `+limitParam+`::int
+			FOR UPDATE SKIP LOCKED
+		 ), rescued AS (
+			UPDATE pgqueue_jobs j
+			SET state = stuck.next_state,
+			    available_at = CASE WHEN stuck.next_state = 'available' THEN NOW() ELSE j.available_at END,
+			    last_error = CASE WHEN stuck.next_state = 'available' THEN j.last_error
+			                      ELSE COALESCE(j.last_error, `+reasonParam+`) END,
 			    claimed_by = NULL,
 			    claimed_at = NULL,
-			    available_at = NOW(),
+			    done_at = CASE WHEN stuck.next_state = 'available' THEN NULL ELSE NOW() END,
 			    updated_at = NOW()
-			WHERE `+stuck+`
-			  AND attempts < max_attempts
-			RETURNING queue_name
+			FROM stuck
+			WHERE j.id = stuck.id AND j.state = 'running'
+			RETURNING j.queue_name, j.state
+		 ), notified AS (
+			SELECT `+notifySQL("requeued")+`
+			FROM (SELECT DISTINCT queue_name FROM rescued WHERE state = 'available') requeued
 		 )
-		 SELECT 1 FROM requeued, `+notifySQL("requeued"),
-		p.VisibilityTimeout.Seconds(), queueNames,
+		 SELECT queue_name, state, (SELECT count(*) FROM notified) FROM rescued`,
+		append(args, limitArg, reason)...,
 	)
 	if err != nil {
-		return ReapResult{}, fmt.Errorf("pgqueue: reap requeue: %w", err)
+		return nil, err
 	}
-	requeued, _ := resRequeue.RowsAffected()
-
-	resFail, err := c.db.ExecContext(ctx,
-		`UPDATE pgqueue_jobs
-		 SET status = 'failed',
-		     last_error = COALESCE(last_error, 'reaped: visibility timeout exceeded'),
-		     claimed_by = NULL,
-		     claimed_at = NULL,
-		     done_at = NOW(),
-		     updated_at = NOW()
-		 WHERE `+stuck+`
-		   AND attempts >= max_attempts`,
-		p.VisibilityTimeout.Seconds(), queueNames,
-	)
-	if err != nil {
-		return ReapResult{Requeued: requeued}, fmt.Errorf("pgqueue: reap fail: %w", err)
+	defer func() { _ = rows.Close() }()
+	var jobs []rescuedJob
+	for rows.Next() {
+		var job rescuedJob
+		var notified int
+		if err := rows.Scan(&job.queueName, &job.state, &notified); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
 	}
-	failed, _ := resFail.RowsAffected()
+	return jobs, rows.Err()
+}
 
-	result := ReapResult{Requeued: requeued, Failed: failed}
-	c.emit(ctx, EventReap, map[string]any{"requeued": requeued, "failed": failed})
-	return result, nil
+func countRescued(jobs []rescuedJob) ReapResult {
+	var result ReapResult
+	for _, job := range jobs {
+		switch job.state {
+		case StateAvailable:
+			result.Requeued++
+		case StateCancelled:
+			result.Cancelled++
+		default:
+			result.Failed++
+		}
+	}
+	return result
 }
 
 // ---------------------------------------------------------------------------
@@ -802,15 +811,18 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	}
 
 	// Build query dynamically based on optional filters.
-	query := `SELECT id, queue_name, payload, status, attempts, max_attempts, claims, available_at,
-	                 claimed_by, claimed_at, done_at, last_error, created_at, updated_at
-	          FROM pgqueue_jobs WHERE 1=1`
+	query := `SELECT ` + jobColumns("") + ` FROM pgqueue_jobs WHERE 1=1`
 	args := make([]any, 0, 4)
 	argIdx := 1
 
 	if p.QueueName != "" {
 		query += fmt.Sprintf(" AND queue_name = $%d", argIdx)
 		args = append(args, p.QueueName)
+		argIdx++
+	}
+	if p.State != "" {
+		query += fmt.Sprintf(" AND state = $%d", argIdx)
+		args = append(args, string(p.State))
 		argIdx++
 	}
 	if p.Status != "" {
@@ -848,11 +860,7 @@ func (c *Client) ListJobs(ctx context.Context, p ListJobsParams) ([]Job, error) 
 	jobs := make([]Job, 0, p.Limit)
 	for rows.Next() {
 		var j Job
-		if err := rows.Scan(
-			&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
-			&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-			&j.CreatedAt, &j.UpdatedAt,
-		); err != nil {
+		if err := rows.Scan(j.scanTargets()...); err != nil {
 			return nil, fmt.Errorf("pgqueue: scan list jobs: %w", err)
 		}
 		jobs = append(jobs, j)
@@ -886,6 +894,11 @@ func (c *Client) CountJobs(ctx context.Context, p ListJobsParams) (int64, error)
 		args = append(args, p.QueueName)
 		argIdx++
 	}
+	if p.State != "" {
+		query += fmt.Sprintf(" AND state = $%d", argIdx)
+		args = append(args, string(p.State))
+		argIdx++
+	}
 	if p.Status != "" {
 		query += fmt.Sprintf(" AND status = $%d", argIdx)
 		args = append(args, string(p.Status))
@@ -912,19 +925,10 @@ func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
 		return nil, ErrNilDB
 	}
 
-	row := c.db.QueryRowContext(ctx,
-		`SELECT id, queue_name, payload, status, attempts, max_attempts, claims, available_at,
-                claimed_by, claimed_at, done_at, last_error, created_at, updated_at
-         FROM pgqueue_jobs WHERE id = $1`,
-		id,
-	)
+	row := c.db.QueryRowContext(ctx, `SELECT `+jobColumns("")+` FROM pgqueue_jobs WHERE id = $1`, id)
 
 	var j Job
-	if err := row.Scan(
-		&j.ID, &j.QueueName, &j.Payload, &j.Status, &j.Attempts, &j.MaxAttempts, &j.Claims,
-		&j.AvailableAt, &j.ClaimedBy, &j.ClaimedAt, &j.DoneAt, &j.LastError,
-		&j.CreatedAt, &j.UpdatedAt,
-	); err != nil {
+	if err := row.Scan(j.scanTargets()...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrJobNotFound
 		}
@@ -934,7 +938,8 @@ func (c *Client) GetJob(ctx context.Context, id int64) (*Job, error) {
 	return &j, nil
 }
 
-// ReplayJob resets a done/failed job to pending and clears runtime state.
+// ReplayJob makes a completed, cancelled or discarded job available again with a
+// fresh attempt budget, and clears its runtime state.
 func (c *Client) ReplayJob(ctx context.Context, id int64) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
@@ -942,7 +947,7 @@ func (c *Client) ReplayJob(ctx context.Context, id int64) error {
 	return c.ReplayJobTx(ctx, nil, id)
 }
 
-// ReplayJobTx resets a done/failed job to pending and clears runtime state within an optional transaction.
+// ReplayJobTx is ReplayJob within an optional transaction.
 func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
@@ -956,16 +961,17 @@ func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	res, err := exec.ExecContext(ctx,
 		`WITH replayed AS (
 			UPDATE pgqueue_jobs
-			SET status = 'pending',
+			SET state = 'available',
 			    attempts = 0,
 			    available_at = NOW(),
 			    claimed_by = NULL,
 			    claimed_at = NULL,
+			    cancel_requested_at = NULL,
 			    done_at = NULL,
 			    last_error = NULL,
 			    updated_at = NOW()
 			WHERE id = $1
-			  AND status IN ('done', 'failed')
+			  AND state IN ('completed', 'cancelled', 'discarded')
 			RETURNING queue_name
 		 )
 		 SELECT 1 FROM replayed, `+notifySQL("replayed"),
@@ -983,14 +989,14 @@ func (c *Client) ReplayJobTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	return nil
 }
 
-// DeleteJob deletes a job that is not currently processing.
+// DeleteJob deletes a job that is not running.
 func (c *Client) DeleteJob(ctx context.Context, id int64) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB
 	}
 
 	res, err := c.db.ExecContext(ctx,
-		`DELETE FROM pgqueue_jobs WHERE id = $1 AND status <> 'processing'`,
+		`DELETE FROM pgqueue_jobs WHERE id = $1 AND state <> 'running'`,
 		id,
 	)
 	if err != nil {
@@ -1003,15 +1009,15 @@ func (c *Client) DeleteJob(ctx context.Context, id int64) error {
 	}
 
 	// Distinguish not-found from busy.
-	var status string
-	err = c.db.QueryRowContext(ctx, `SELECT status FROM pgqueue_jobs WHERE id = $1`, id).Scan(&status)
+	var state JobState
+	err = c.db.QueryRowContext(ctx, `SELECT state FROM pgqueue_jobs WHERE id = $1`, id).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("pgqueue: delete job id=%d: %w", id, ErrJobNotFound)
 	}
 	if err != nil {
 		return fmt.Errorf("pgqueue: delete job status check: %w", err)
 	}
-	if status == string(StatusProcessing) {
+	if state == StateRunning {
 		return fmt.Errorf("pgqueue: delete job id=%d: %w", id, ErrJobBusy)
 	}
 

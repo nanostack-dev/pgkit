@@ -257,13 +257,15 @@ type WorkerConfig struct {
 	BackoffMax        time.Duration
 	RetryDelay        RetryDelayFunc
 
-	// OnJobFailed is called when a job permanently fails (NonRetryable error
-	// or max retries exhausted via Retry's zombie-prevention path).
+	// OnJobFailed is called when a job is discarded: a NonRetryable error or
+	// exhausted attempts. A cancelled job does not call it.
 	// nil = no callback.
 	OnJobFailed func(ctx context.Context, job Job)
 
-	// OnJobStuck is called when the reaper recovers stuck jobs.
-	// result contains the count of requeued and failed jobs.
+	// OnJobStuck is called when stuck jobs of the worker's queues are taken
+	// back: by the worker's own reap, which runs every ReapInterval with
+	// VisibilityTimeout, or by the leader's rescuer. Both run only while this
+	// client is the maintenance leader, so the callback runs in one process.
 	// nil = no callback.
 	OnJobStuck func(ctx context.Context, result ReapResult)
 }
@@ -325,6 +327,7 @@ type Worker struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 	running   atomic.Bool
+	cancels   atomic.Pointer[subscription]
 }
 
 func NewWorker(client *Client, registry *HandlerRegistry, cfg WorkerConfig) (*Worker, error) {
@@ -372,6 +375,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	wake, seesEveryLaterJob, stopListening := w.listen()
 	defer stopListening()
 
+	leaveMaintenance := w.client.maintainer.join(w)
+	defer leaveMaintenance()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -379,6 +385,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-scanTicker.C:
 		case <-wake:
 		case <-reapTicker.C:
+			if !w.client.maintainer.leading() {
+				continue
+			}
 			if err := w.reap(ctx); err != nil {
 				w.client.logFailure(ctx, "queue reap cycle failed", map[string]any{"error": err.Error()}, err)
 			}
@@ -404,7 +413,17 @@ func (w *Worker) listen() (wake chan struct{}, seesEveryLaterJob func() bool, st
 		return first, func() bool { return true }, func() {}
 	}
 	sub := w.client.notifier.subscribe(w.registry.queueNames())
-	return sub.wake, sub.listening.Load, func() { w.client.notifier.unsubscribe(sub) }
+	cancelKeys := make([]string, 0, len(w.registry.queueNames()))
+	for _, name := range w.registry.queueNames() {
+		cancelKeys = append(cancelKeys, cancelKeyPrefix+name)
+	}
+	cancels := w.client.notifier.subscribe(cancelKeys)
+	w.cancels.Store(cancels)
+	return sub.wake, sub.listening.Load, func() {
+		w.cancels.Store(nil)
+		w.client.notifier.unsubscribe(cancels)
+		w.client.notifier.unsubscribe(sub)
+	}
 }
 
 type scanResult struct {
@@ -452,7 +471,7 @@ func (w *Worker) scan(ctx context.Context) scanResult {
 func (w *Worker) claim(workerCtx context.Context, queueName string) (*Job, bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(workerCtx), settleTimeout)
 	defer cancel()
-	return w.client.Claim(ctx, queueName, w.cfg.WorkerID)
+	return w.client.claim(ctx, queueName, w.cfg.WorkerID, w.cfg.VisibilityTimeout)
 }
 
 // handBack returns a job claimed as the worker began stopping, due now and without
@@ -480,8 +499,55 @@ func (w *Worker) handBack(workerCtx context.Context, job *Job) {
 func (w *Worker) run(workerCtx context.Context, h Handler, job *Job) {
 	ctx, span := startJobSpan(workerCtx, job)
 	defer span.End()
-	handlerErr := h(ctx, *job)
+	handlerCtx, cancelHandler := context.WithCancelCause(ctx)
+	stopWatching := w.watchCancel(handlerCtx, job, cancelHandler)
+	handlerErr := h(handlerCtx, *job)
+	stopWatching()
+	cancelHandler(nil)
 	recordJobOutcome(span, w.settle(ctx, job, handlerErr), handlerErr)
+}
+
+// ErrJobCancelled is the cause of a handler context cancelled because its job was
+// cancelled with Client.Cancel.
+var ErrJobCancelled = errors.New("pgqueue: job cancelled")
+
+// watchCancel cancels the handler's context when Client.Cancel asks job to stop.
+// Only OnEnqueue workers listen for cancel requests; others record the outcome
+// as cancelled when the handler returns.
+func (w *Worker) watchCancel(ctx context.Context, job *Job, cancelHandler context.CancelCauseFunc) (stop func()) {
+	cancels := w.cancels.Load()
+	if cancels == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-cancels.wake:
+			}
+			requested, err := w.client.cancelRequested(ctx, *job)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.client.logFailure(ctx, "queue cancel check failed", map[string]any{"id": job.ID, "error": err.Error()}, err)
+				}
+				continue
+			}
+			if requested {
+				cancelHandler(ErrJobCancelled)
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-watched
+	}
 }
 
 // settle records the handler's outcome for job and returns it. It uses a context
@@ -499,29 +565,65 @@ func (w *Worker) settle(workerCtx context.Context, job *Job, handlerErr error) s
 		return jobOutcomeDone
 	case IsHandled(handlerErr):
 		return jobOutcomeHandled
-	case IsNonRetryable(handlerErr):
-		if failErr := w.client.Fail(ctx, job.ID, handlerErr); failErr != nil {
-			w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
-		} else {
-			w.notifyJobFailed(ctx, job, handlerErr)
+	case IsCancel(handlerErr):
+		if cancelErr := w.client.cancelJob(ctx, *job, handlerErr); cancelErr != nil {
+			w.client.logError(ctx, "queue cancel failed", map[string]any{"id": job.ID, "error": cancelErr.Error()})
 		}
-		return jobOutcomeFailed
+		return jobOutcomeCancelled
+	case IsSnooze(handlerErr):
+		return w.snooze(ctx, job, handlerErr)
+	case IsNonRetryable(handlerErr):
+		state, failErr := failJob(ctx, w.client.db, job.ID, handlerErr, w.client)
+		if failErr != nil {
+			w.client.logError(ctx, "queue fail failed", map[string]any{"id": job.ID, "error": failErr.Error()})
+			return jobOutcomeFailed
+		}
+		return w.finalOutcome(ctx, job, state, handlerErr)
 	default:
 		delay := w.cfg.RetryDelay(*job, handlerErr)
-		if retryErr := w.client.Retry(ctx, job.ID, delay, handlerErr); retryErr != nil {
+		state, retryErr := retryJob(ctx, w.client.db, job.ID, delay, handlerErr, w.client)
+		if retryErr != nil {
 			w.client.logError(ctx, "queue retry failed", map[string]any{"id": job.ID, "error": retryErr.Error()})
-		} else if job.Attempts >= job.MaxAttempts {
-			w.notifyJobFailed(ctx, job, handlerErr)
-			return jobOutcomeFailed
+			return jobOutcomeRetry
+		}
+		if state.Finalized() {
+			return w.finalOutcome(ctx, job, state, handlerErr)
 		}
 		return jobOutcomeRetry
 	}
+}
+
+func (w *Worker) snooze(ctx context.Context, job *Job, handlerErr error) string {
+	var snoozed snoozeError
+	errors.As(handlerErr, &snoozed)
+	if snoozed.after < 0 {
+		return w.settle(ctx, job, ErrInvalidSnooze)
+	}
+	state, err := w.client.snoozeFor(ctx, *job, snoozed.after)
+	if err != nil {
+		w.client.logError(ctx, "queue snooze failed", map[string]any{"id": job.ID, "error": err.Error()})
+	}
+	if state == StateCancelled {
+		return jobOutcomeCancelled
+	}
+	return jobOutcomeSnoozed
+}
+
+// finalOutcome reports a job that a failure finalized: discarded jobs call
+// OnJobFailed, cancelled ones do not.
+func (w *Worker) finalOutcome(ctx context.Context, job *Job, state JobState, cause error) string {
+	if state == StateCancelled {
+		return jobOutcomeCancelled
+	}
+	w.notifyJobFailed(ctx, job, cause)
+	return jobOutcomeFailed
 }
 
 func (w *Worker) notifyJobFailed(ctx context.Context, job *Job, cause error) {
 	if w.cfg.OnJobFailed == nil {
 		return
 	}
+	job.State = StateDiscarded
 	job.Status = StatusFailed
 	job.LastError = sql.NullString{String: cause.Error(), Valid: true}
 	w.cfg.OnJobFailed(ctx, *job)
