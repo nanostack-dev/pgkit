@@ -6,11 +6,17 @@ pgkit supplies coordination and durable execution primitives. Applications own t
 
 **Queue:** A named stream of jobs sharing a compatible payload contract and handler. Producers and workers using one name must agree on that contract.
 
-**Job:** One durable request for work, including its payload, availability, claim and attempt history. A job is pending, processing, done or failed.
+**Job:** One durable request for work, including its payload, availability, claim and attempt history. A job is available, scheduled, running, retryable, completed, cancelled or discarded. Its legacy status (pending, processing, done, failed) is a coarse projection of that state.
+
+**Cancelled / discarded:** Two final states. A cancelled job was asked to stop; a discarded job gave up (attempts exhausted or a non-retryable failure).
+
+**Lease:** The time until which a worker's claim is trusted; a heartbeat extends it, and the leader takes back a running job whose lease expired.
+
+**Maintenance leader:** The one client per database, elected through a renewable lease, that runs the scheduler, rescuer and retention cleaner.
 
 **Pickup:** The policy governing when a worker searches for claimable jobs: notification-driven with periodic rescans, or polling.
 
-**Claim:** Temporary ownership of a processing job by a worker. It ends with acknowledgement, retry, failure or stuck-job recovery.
+**Claim:** Temporary ownership of a running job by a worker. It ends with acknowledgement, retry, failure, cancellation, snooze or stuck-job recovery.
 
 **Schedule:** A named durable interval cadence shared by replicas. Restarting a process does not create a separate cadence.
 

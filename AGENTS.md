@@ -15,7 +15,7 @@ This repository is sufficient for standalone work. A shared Nanostack workspace 
 ## Invariants
 
 - Prefer PostgreSQL-native primitives: advisory locks, `FOR UPDATE SKIP LOCKED`, DB time via `NOW()`.
-- Queue transitions are explicit and guarded, especially `processing -> done|pending|failed`.
+- Queue transitions are explicit and guarded on `state`, especially `running -> completed|retryable|available|discarded|cancelled`; the legacy `status` column is derived by trigger, never written by new code.
 - Public APIs stay stable; extend via params structs rather than new positional args.
 - Never surface internal DB errors, secrets, or auth tokens through the dashboard/API.
 - Mutating dashboard/API endpoints stay disable-able in production and are protected by constant-time token auth plus CSRF mitigation.

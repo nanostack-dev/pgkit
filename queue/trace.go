@@ -20,6 +20,9 @@ const (
 	jobOutcomeHandled = "handled"
 	jobOutcomeRetry   = "retry"
 	jobOutcomeFailed  = "failed"
+
+	jobOutcomeCancelled = "cancelled"
+	jobOutcomeSnoozed   = "snoozed"
 )
 
 const (
@@ -83,7 +86,7 @@ func recordJobOutcome(span trace.Span, outcome string, handlerErr error) {
 		return
 	}
 	span.SetAttributes(attrJobOutcome.String(outcome))
-	if handlerErr == nil || outcome == jobOutcomeHandled {
+	if handlerErr == nil || outcome == jobOutcomeHandled || outcome == jobOutcomeSnoozed {
 		return
 	}
 	span.RecordError(handlerErr)

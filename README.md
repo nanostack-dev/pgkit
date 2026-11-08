@@ -29,7 +29,8 @@ go get github.com/nanostack-dev/pgkit
 - typed JSON listener with metadata: `RegisterJSONTyped[T](...)`
 - typed JSON listener only: `RegisterJSON[T](...)`
 
-Worker handles claim loop, ack/retry/fail, and stuck-job reaping.
+Worker handles claim loop, ack/retry/fail, cancel and snooze, and takes part in
+the election of the maintenance leader (see [Job states and maintenance](#job-states-and-maintenance)).
 
 Bind a queue name and JSON payload type once for both producers and workers:
 
@@ -108,18 +109,66 @@ the listener up; from then on a newly claimable job wakes the worker.
 `PollInterval` still works and means `PollEvery(PollInterval)`; set it or
 `Pickup`, not both.
 
-A worker reaps stuck jobs of its own queues only, with its `VisibilityTimeout`;
+Each worker reaps stuck jobs of its own queues with its `VisibilityTimeout`, but
+only in the process that is the maintenance leader (see
+[Job states and maintenance](#job-states-and-maintenance));
 `client.Reap(ctx, queue.ReapParams{...})` does the same for chosen queues and
-`ReapStuckJobs` for all of them. Workers claim and settle jobs on contexts that
+`ReapStuckJobs` for all of them, from any process. Workers claim and settle jobs on contexts that
 shutdown does not cancel: a handler finishing while its worker stops still settles
 its job, and a job claimed as the worker stops is handed back at once.
 
+### Job states and maintenance
+
+A job is `available` (due), `scheduled` (enqueued for later, snoozed or parked),
+`running` (claimed), `retryable` (waiting out its backoff), `completed`,
+`cancelled` (asked to stop) or `discarded` (attempts exhausted, `NonRetryable` or
+`Fail`). `Job.State` and `ListJobsParams.State` use these. `Job.Status` and the
+`pgqueue_jobs.status` column keep the older coarse values (`pending`, `processing`,
+`done`, `failed`) in sync for existing code and queries; prefer the state.
+
+The claim takes available jobs and scheduled or retryable jobs that are due, so
+no job waits on maintenance. One client per database is elected leader
+(`pgqueue_leader`, renewed every 5 s, 15 s lease); every running worker takes
+part, and `client.RunMaintenance(ctx)` takes part without a worker. While it
+leads, a client:
+
+- makes due scheduled and retryable jobs available every second and notifies
+  their queues, so OnEnqueue workers take delayed jobs and retries as they fall due;
+- takes back running jobs whose lease expired (worker claims carry a lease of
+  `VisibilityTimeout`, which `Heartbeat` extends), and claims without a lease
+  (`Client.Claim`, binaries older than schema v5) after `RescueAfter` (one hour);
+- runs each local worker's reap of its own queues every `ReapInterval`, so
+  `OnJobStuck` runs in the leader process only;
+- purges finalized jobs when `MaintenanceConfig.Retention` is set;
+- finishes the schema migration with `CompleteSchema` until it is complete.
+
+```go
+err := client.SetMaintenance(queue.MaintenanceConfig{
+	Retention: &queue.RetentionPolicy{KeepDone: 24 * time.Hour, KeepFailed: 7 * 24 * time.Hour, KeepCancelled: 7 * 24 * time.Hour},
+})
+leader := client.IsLeader()
+```
+
+A handler, or anyone, can stop or delay a job:
+
+```go
+state, err := client.Cancel(ctx, jobID)  // or CancelTx; cancelled now, or a cancel request when running
+return queue.Cancel(err)                // from a handler: cancelled, not retried, no OnJobFailed
+return queue.Snooze(10 * time.Minute)   // from a handler: scheduled again, attempt not counted
+```
+
+A cancel request on a running job cancels the handler's context with cause
+`queue.ErrJobCancelled` on OnEnqueue workers; on polling workers the handler runs
+to its end. Either way the job becomes cancelled unless the handler succeeds.
+The [lifecycle note](docs/technical/queue-job-lifecycle.md) has the design and the
+online migration.
+
 ### Long-running and parked jobs
 
-`OnJobFailed` runs after a terminal failure or an exhausted retry has been
-persisted successfully. Its job snapshot has `StatusFailed` and the handler
-error in `LastError`; without a callback, settlement leaves that in-memory
-snapshot untouched.
+`OnJobFailed` runs after a job is discarded (a terminal failure or an exhausted
+retry) and that has been persisted successfully. Its job snapshot has
+`StateDiscarded`, `StatusFailed` and the handler error in `LastError`; without a
+callback, settlement leaves that in-memory snapshot untouched.
 
 These primitives let a handler keep, park or hand back the job it holds. The
 workflow package is built on them.
@@ -127,8 +176,9 @@ workflow package is built on them.
 ```go
 err := client.Heartbeat(ctx, job)                  // extend the claim; ErrJobNotFound once it is lost
 err = client.LockClaimTx(ctx, tx, job)             // hold the claim (row lock) for the rest of tx
-err = client.SnoozeTx(ctx, tx, job, until)         // back to pending at until, attempt not counted
+err = client.SnoozeTx(ctx, tx, job, until)         // scheduled until until, attempt not counted
 err = client.SnoozeTx(ctx, tx, job, time.Time{})   // parked until woken (available at queue.ParkedUntil)
+// A job with a cancel request becomes cancelled instead of snoozed or parked.
 err = client.WakeTx(ctx, tx, jobID)                // a parked or delayed job becomes due now, workers notified
 ```
 
@@ -139,8 +189,23 @@ number counts every claim and only grows; `attempts` stays the retry budget, whi
 `SnoozeTx` refunds and a replay resets. Durations and timeouts keep sub-second
 precision; `Reap` refuses a non-positive visibility timeout. `EnsureSchema` adds
 the `claims` column to existing queues (schema version 2), the `trace_context`
-column (schema version 3, see [Tracing](#tracing)) and the finished-jobs index
-(schema version 4, see [Retention](#retention)).
+column (schema version 3, see [Tracing](#tracing)), the finished-jobs index
+(schema version 4, see [Retention](#retention)) and job states with leases,
+cancel requests and the leader table (schema version 5).
+
+`EnsureSchema` is safe on the start path of a large, busy queue. It takes table
+locks with a 1 s `lock_timeout` and retries with backoff, so writers never wait
+more than a second behind it, and it backfills the state of live jobs only. The
+steps of schema version 5 that read the whole table (backfilling the state of
+finished jobs, validating constraints, building the state indexes) run in
+`client.CompleteSchema(ctx)`. The maintenance leader calls it on its own, so a
+deployment with a running worker or `RunMaintenance` needs nothing more; call it
+from a migration job to finish at a time of your choice. Expect about 3 s per
+index per million rows (four indexes), plus the backfill of finished jobs; it
+never blocks writers. On a table of at most 10,000 rows, a new database included,
+`EnsureSchema` completes the schema itself. Until `CompleteSchema` finishes,
+finished jobs from before the migration match no state filter, are not purged,
+and `ReplayJob` returns `ErrJobNotFound` for them.
 
 `client.Subscribe(keys...)` and `client.NotifyTx(ctx, tx, key)` reuse the shared
 `LISTEN` connection for other keys: a subscription wakes when a notification for
@@ -148,25 +213,30 @@ one of its keys commits, and when the listener reconnects.
 
 ### Retention
 
-Done and failed jobs stay in `pgqueue_jobs` until something deletes them. Without
+Completed, discarded and cancelled jobs stay in `pgqueue_jobs` until something
+deletes them. Without
 retention the table grows with every job ever run, and each `ListJobs`, `CountJobs`
 and dashboard read gets slower. `RunRetention` deletes them on a schedule, for every
 queue in the database:
 
 ```go
 go client.RunRetention(ctx, queue.RetentionPolicy{
-	KeepDone:   7 * 24 * time.Hour,
-	KeepFailed: 30 * 24 * time.Hour,
+	KeepDone:      7 * 24 * time.Hour,  // completed
+	KeepFailed:    30 * 24 * time.Hour, // discarded
+	KeepCancelled: 30 * 24 * time.Hour,
 })
 ```
+
+`MaintenanceConfig.Retention` runs the same purge on the elected leader only,
+instead of on every replica.
 
 With `fx/queue`, set `queuefx.Options{Retention: &policy}` instead; the app then
 fails to start on an invalid policy, and the loop stops with the app.
 
 - Age is measured from the job's last update (`updated_at`), so a job is kept for
   its full period after it finishes, however long it waited before.
-- A zero `KeepDone` or `KeepFailed` keeps that status forever; the policy must set
-  at least one. Pending and processing jobs are never deleted.
+- A zero `KeepDone`, `KeepFailed` or `KeepCancelled` keeps that state forever; the
+  policy must set at least one. Jobs that are not finalized are never deleted.
 - It purges at start and then every `Interval` (default one hour), in batches of
   `BatchSize` jobs (default 1000), each batch its own transaction. The first run on
   a large table therefore deletes its backlog without one long lock.
@@ -175,8 +245,8 @@ fails to start on an invalid policy, and the loop stops with the app.
 - `PurgeFinished` runs one purge and returns the counts. `Purge` still deletes one
   status at a time on demand.
 
-The purge queries name the status literally, so they use the partial index
-`idx_pgqueue_finished (status, updated_at) WHERE status IN ('done', 'failed')`
+The purge queries name the state literally, so they use the partial index
+`idx_pgqueue_finalized (state, updated_at) WHERE state IN ('completed', 'cancelled', 'discarded')`
 under any plan, generic plans included.
 
 ### Tracing

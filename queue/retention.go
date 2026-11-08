@@ -14,12 +14,17 @@ const (
 	defaultRetentionBatchSize = 1000
 )
 
-// RetentionPolicy sets how long finished jobs of every queue stay in
-// pgqueue_jobs, measured from their last update. A zero KeepDone or KeepFailed
-// keeps jobs of that status forever.
+// RetentionPolicy sets how long finalized jobs of every queue stay in
+// pgqueue_jobs, measured from their last update. A zero duration keeps jobs of
+// that state forever.
 type RetentionPolicy struct {
-	KeepDone   time.Duration
+	// KeepDone is the retention of completed jobs.
+	KeepDone time.Duration
+	// KeepFailed is the retention of discarded jobs: attempts exhausted,
+	// NonRetryable or Fail.
 	KeepFailed time.Duration
+	// KeepCancelled is the retention of cancelled jobs.
+	KeepCancelled time.Duration
 	// Interval is the time between purges; it defaults to one hour.
 	Interval time.Duration
 	// BatchSize is the number of jobs deleted per transaction; it defaults to 1000.
@@ -28,8 +33,9 @@ type RetentionPolicy struct {
 
 // RetentionResult counts the jobs a purge deleted.
 type RetentionResult struct {
-	Done   int64
-	Failed int64
+	Done      int64 // completed
+	Failed    int64 // discarded
+	Cancelled int64
 }
 
 func (p RetentionPolicy) withDefaults() RetentionPolicy {
@@ -48,36 +54,40 @@ func (p RetentionPolicy) Validate() error {
 }
 
 func (p RetentionPolicy) validate() error {
-	if p.KeepDone < 0 || p.KeepFailed < 0 || p.Interval <= 0 || p.BatchSize <= 0 {
+	if p.KeepDone < 0 || p.KeepFailed < 0 || p.KeepCancelled < 0 || p.Interval <= 0 || p.BatchSize <= 0 {
 		return ErrInvalidRetentionPolicy
 	}
-	if p.KeepDone == 0 && p.KeepFailed == 0 {
-		return fmt.Errorf("%w: set KeepDone or KeepFailed", ErrInvalidRetentionPolicy)
+	if p.KeepDone == 0 && p.KeepFailed == 0 && p.KeepCancelled == 0 {
+		return fmt.Errorf("%w: set KeepDone, KeepFailed or KeepCancelled", ErrInvalidRetentionPolicy)
 	}
 	return nil
 }
 
-// The status is a literal, not a parameter, so that every plan, generic ones
-// included, can use the partial index idx_pgqueue_finished. SKIP LOCKED lets
-// replicas purge at the same time without waiting on each other.
-const (
-	deleteExpiredDoneSQL = `DELETE FROM pgqueue_jobs WHERE id IN (
+// The state is a literal, not a parameter, so that every plan, generic ones
+// included, can use the partial index idx_pgqueue_finalized. The redundant status
+// literal lets the legacy index idx_pgqueue_finished serve the purge until
+// CompleteSchema has built that index. SKIP LOCKED lets replicas purge at the
+// same time without waiting on each other.
+func deleteExpiredSQL(state JobState) string {
+	return `DELETE FROM pgqueue_jobs WHERE id IN (
 	SELECT id FROM pgqueue_jobs
-	WHERE status = 'done' AND updated_at < NOW() - make_interval(secs => $1)
+	WHERE state = '` + string(state) + `' AND status = '` + string(state.LegacyStatus()) + `'
+	  AND updated_at < NOW() - make_interval(secs => $1::float8)
 	LIMIT $2
 	FOR UPDATE SKIP LOCKED
 )`
-	deleteExpiredFailedSQL = `DELETE FROM pgqueue_jobs WHERE id IN (
-	SELECT id FROM pgqueue_jobs
-	WHERE status = 'failed' AND updated_at < NOW() - make_interval(secs => $1)
-	LIMIT $2
-	FOR UPDATE SKIP LOCKED
-)`
+}
+
+var (
+	deleteExpiredCompletedSQL = deleteExpiredSQL(StateCompleted)
+	deleteExpiredDiscardedSQL = deleteExpiredSQL(StateDiscarded)
+	deleteExpiredCancelledSQL = deleteExpiredSQL(StateCancelled)
 )
 
-// PurgeFinished deletes the done and failed jobs of every queue that are older
-// than policy keeps them. It deletes in batches of policy.BatchSize, each in its
-// own transaction, until no expired job is left or ctx is canceled.
+// PurgeFinished deletes the completed, discarded and cancelled jobs of every
+// queue that are older than policy keeps them. It deletes in batches of
+// policy.BatchSize, each in its own transaction, until no expired job is left or
+// ctx is canceled.
 func (c *Client) PurgeFinished(ctx context.Context, policy RetentionPolicy) (RetentionResult, error) {
 	if c == nil || c.db == nil {
 		return RetentionResult{}, ErrNilDB
@@ -88,28 +98,34 @@ func (c *Client) PurgeFinished(ctx context.Context, policy RetentionPolicy) (Ret
 	}
 
 	var result RetentionResult
-	var err error
-	if policy.KeepDone > 0 {
-		result.Done, err = c.deleteExpired(ctx, deleteExpiredDoneSQL, policy.KeepDone, policy.BatchSize)
-		if err != nil {
-			return result, fmt.Errorf("pgqueue: purge done jobs: %w", err)
-		}
+	purges := []struct {
+		state   JobState
+		keep    time.Duration
+		query   string
+		deleted *int64
+	}{
+		{StateCompleted, policy.KeepDone, deleteExpiredCompletedSQL, &result.Done},
+		{StateDiscarded, policy.KeepFailed, deleteExpiredDiscardedSQL, &result.Failed},
+		{StateCancelled, policy.KeepCancelled, deleteExpiredCancelledSQL, &result.Cancelled},
 	}
-	if policy.KeepFailed > 0 {
-		result.Failed, err = c.deleteExpired(ctx, deleteExpiredFailedSQL, policy.KeepFailed, policy.BatchSize)
+	for _, purge := range purges {
+		if purge.keep <= 0 {
+			continue
+		}
+		deleted, err := c.deleteExpired(ctx, purge.query, purge.keep, policy.BatchSize)
+		*purge.deleted = deleted
 		if err != nil {
-			return result, fmt.Errorf("pgqueue: purge failed jobs: %w", err)
+			return result, fmt.Errorf("pgqueue: purge %s jobs: %w", purge.state, err)
+		}
+		if deleted > 0 {
+			c.emit(ctx, EventPurge, map[string]any{"state": purge.state, "status": purge.state.LegacyStatus(), "deleted": deleted})
 		}
 	}
 
-	if result.Done > 0 {
-		c.emit(ctx, EventPurge, map[string]any{"status": StatusDone, "deleted": result.Done})
-	}
-	if result.Failed > 0 {
-		c.emit(ctx, EventPurge, map[string]any{"status": StatusFailed, "deleted": result.Failed})
-	}
-	if result.Done > 0 || result.Failed > 0 {
-		c.logInfo(ctx, "queue purged finished jobs", map[string]any{"done": result.Done, "failed": result.Failed})
+	if result.Done > 0 || result.Failed > 0 || result.Cancelled > 0 {
+		c.logInfo(ctx, "queue purged finished jobs", map[string]any{
+			"done": result.Done, "failed": result.Failed, "cancelled": result.Cancelled,
+		})
 	}
 	return result, nil
 }
@@ -136,6 +152,7 @@ func (c *Client) deleteExpired(ctx context.Context, query string, keep time.Dura
 // RunRetention purges finished jobs at once and then every policy.Interval,
 // until ctx is canceled. A failed purge is logged and retried at the next
 // interval. Run it once per process: replicas may run it at the same time.
+// MaintenanceConfig.Retention runs the same purge on the elected leader only.
 func (c *Client) RunRetention(ctx context.Context, policy RetentionPolicy) error {
 	if c == nil || c.db == nil {
 		return ErrNilDB

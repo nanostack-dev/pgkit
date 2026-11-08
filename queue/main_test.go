@@ -14,14 +14,16 @@ import (
 )
 
 var shared struct {
-	once      sync.Once
-	container testcontainers.Container
-	db        *sql.DB
-	err       error
+	once       sync.Once
+	container  testcontainers.Container
+	db         *sql.DB
+	connString string
+	err        error
 }
 
 func TestMain(m *testing.M) {
 	code := m.Run()
+	removeOldPgkitBuild()
 	if shared.db != nil {
 		_ = shared.db.Close()
 	}
@@ -43,6 +45,7 @@ func sharedQueue(t *testing.T) *Client {
 			return
 		}
 		shared.container = container
+		shared.connString = connString
 		shared.db, shared.err = sql.Open("pgx", connString)
 		if shared.err == nil {
 			pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
