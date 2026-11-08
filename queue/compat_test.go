@@ -124,8 +124,8 @@ func startOldPgkit(t *testing.T, dsn string) *oldPgkit {
 			}
 		case <-time.After(30 * time.Second):
 			_ = cmd.Process.Kill()
-			<-done
-			t.Errorf("released pgkit driver did not stop\n%s", stderr)
+			killErr := <-done
+			t.Errorf("released pgkit driver did not stop (exit after kill: %v)\n%s", killErr, stderr)
 		}
 	})
 	return old
